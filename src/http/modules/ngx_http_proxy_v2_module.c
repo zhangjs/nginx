@@ -69,6 +69,7 @@ struct ngx_http_proxy_v2_header_block_s {
     ngx_http_proxy_v2_header_block_t  *next;
     ngx_list_t                         fields;
     ngx_uint_t                         status;
+    size_t                             length;
 
     /* raw header frames, see ngx_http_proxy_v2_record_header() */
     size_t                             raw_offset;
@@ -2147,6 +2148,7 @@ static ngx_int_t
 ngx_http_proxy_v2_parse_headers(ngx_http_proxy_v2_stream_t *stream,
     ngx_buf_t *b, ngx_uint_t new_frame)
 {
+    size_t                             size;
     ngx_int_t                          rc, status;
     ngx_table_elt_t                   *h;
     ngx_connection_t                  *c;
@@ -2176,6 +2178,22 @@ ngx_http_proxy_v2_parse_headers(ngx_http_proxy_v2_stream_t *stream,
         if (ngx_http_proxy_v2_record_header(stream, b, new_frame) != NGX_OK) {
             return NGX_ERROR;
         }
+    }
+
+    if (new_frame && !stream->headers_parsed) {
+        /* bound response header input independently of receive buffers */
+
+        size = sizeof(ngx_http_proxy_v2_frame_t) + sess->rest;
+
+        if (block->length > stream->header_buffer_size
+            || size > stream->header_buffer_size - block->length)
+        {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "upstream sent too large http2 header block");
+            return NGX_ERROR;
+        }
+
+        block->length += size;
     }
 
     for ( ;; ) {
