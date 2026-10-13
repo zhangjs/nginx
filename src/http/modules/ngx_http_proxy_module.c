@@ -617,6 +617,20 @@ static ngx_command_t  ngx_http_proxy_commands[] = {
       offsetof(ngx_http_proxy_loc_conf_t, http_version),
       &ngx_http_proxy_http_version },
 
+    { ngx_string("proxy_http2_multiplex"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_loc_conf_t, http2_multiplex),
+      NULL },
+
+    { ngx_string("proxy_http2_max_streams"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_num_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_loc_conf_t, http2_max_streams),
+      NULL },
+
 #if (NGX_HTTP_SSL)
 
     { ngx_string("proxy_ssl_session_reuse"),
@@ -3651,6 +3665,8 @@ ngx_http_proxy_create_loc_conf(ngx_conf_t *cf)
     conf->cookie_flags = NGX_CONF_UNSET_PTR;
 
     conf->http_version = NGX_CONF_UNSET_UINT;
+    conf->http2_multiplex = NGX_CONF_UNSET;
+    conf->http2_max_streams = NGX_CONF_UNSET_UINT;
 
     conf->headers_hash_max_size = NGX_CONF_UNSET_UINT;
     conf->headers_hash_bucket_size = NGX_CONF_UNSET_UINT;
@@ -4067,6 +4083,16 @@ ngx_http_proxy_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 
     ngx_conf_merge_uint_value(conf->http_version, prev->http_version,
                               NGX_HTTP_VERSION_11);
+
+    ngx_conf_merge_value(conf->http2_multiplex, prev->http2_multiplex, 0);
+    ngx_conf_merge_uint_value(conf->http2_max_streams,
+                              prev->http2_max_streams, 128);
+
+    if (conf->http2_max_streams == 0) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "\"proxy_http2_max_streams\" must be at least 1");
+        return NGX_CONF_ERROR;
+    }
 
     ngx_conf_merge_uint_value(conf->headers_hash_max_size,
                               prev->headers_hash_max_size, 512);
