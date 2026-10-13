@@ -16,6 +16,7 @@
 #define NGX_HTTP_PROXY_V2_READ_BUDGET       262144
 #define NGX_HTTP_PROXY_V2_READ_STEPS        64
 #define NGX_HTTP_PROXY_V2_DATA_QUEUE_SIZE   NGX_HTTP_V2_DEFAULT_WINDOW
+#define NGX_HTTP_PROXY_V2_MAX_STREAM_ID     0x7fffffff
 
 
 typedef enum {
@@ -1805,6 +1806,12 @@ ngx_http_proxy_v2_session_can_keepalive(ngx_http_proxy_v2_session_t *sess)
         || ngx_http_proxy_v2_input_pending(sess)
         || ngx_http_proxy_v2_output_pending(sess))
     {
+        return 0;
+    }
+
+    /* stream identifiers cannot be reused (RFC 9113, Section 5.1.1) */
+
+    if (sess->last_stream_id > NGX_HTTP_PROXY_V2_MAX_STREAM_ID - 2) {
         return 0;
     }
 
