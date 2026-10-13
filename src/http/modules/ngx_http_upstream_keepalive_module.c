@@ -19,6 +19,9 @@ typedef struct {
     ngx_queue_t                        cache;
     ngx_queue_t                        free;
 
+    /* shared connections which can take more requests */
+    ngx_queue_t                        shared;
+
     ngx_http_upstream_init_peer_pt     original_init_peer;
 
     ngx_uint_t                         local; /* unsigned  local:1; */
@@ -36,6 +39,7 @@ typedef struct {
     ngx_sockaddr_t                     sockaddr;
 
     ngx_http_upstream_conf_t          *tag;
+    ngx_uint_t                         multiplex; /* unsigned  multiplex:1; */
 
 } ngx_http_upstream_keepalive_cache_t;
 
@@ -67,6 +71,10 @@ static ngx_int_t ngx_http_upstream_get_keepalive_peer(ngx_peer_connection_t *pc,
 static void ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc,
     void *data, ngx_uint_t state);
 
+static ngx_int_t ngx_http_upstream_keepalive_cache(
+    ngx_http_upstream_keepalive_srv_conf_t *kcf, ngx_connection_t *c,
+    ngx_sockaddr_t *sockaddr, socklen_t socklen, void *tag,
+    ngx_uint_t multiplex);
 static void ngx_http_upstream_keepalive_dummy_handler(ngx_event_t *ev);
 static void ngx_http_upstream_keepalive_close_handler(ngx_event_t *ev);
 static void ngx_http_upstream_keepalive_close(ngx_connection_t *c);
@@ -207,9 +215,10 @@ ngx_http_upstream_get_keepalive_peer(ngx_peer_connection_t *pc, void *data)
     ngx_http_upstream_keepalive_peer_data_t  *kp = data;
     ngx_http_upstream_keepalive_cache_t      *item;
 
-    ngx_int_t          rc;
-    ngx_queue_t       *q, *cache;
-    ngx_connection_t  *c;
+    ngx_int_t                              rc;
+    ngx_queue_t                           *q, *cache;
+    ngx_connection_t                      *c;
+    ngx_http_upstream_keepalive_shared_t  *m;
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, pc->log, 0,
                    "get keepalive peer");
@@ -220,6 +229,57 @@ ngx_http_upstream_get_keepalive_peer(ngx_peer_connection_t *pc, void *data)
 
     if (rc != NGX_OK) {
         return rc;
+    }
+
+    if (kp->upstream->multiplex) {
+
+        /* search shared connections, a free slot is reserved */
+
+        cache = &kp->conf->shared;
+
+        for (q = ngx_queue_head(cache);
+             q != ngx_queue_sentinel(cache);
+             q = ngx_queue_next(q))
+        {
+            m = ngx_queue_data(q, ngx_http_upstream_keepalive_shared_t,
+                               queue);
+
+            if (m->connection->requests >= kp->conf->requests
+                || ngx_current_msec - m->connection->start_time
+                   > kp->conf->time)
+            {
+                /* the connection is not used for new requests */
+
+                q = ngx_queue_prev(q);
+                ngx_queue_remove(&m->queue);
+                m->listed = 0;
+                m->spare = 0;
+                continue;
+            }
+
+            if (kp->conf->local && m->tag != kp->upstream->conf) {
+                continue;
+            }
+
+            if (ngx_memn2cmp((u_char *) &m->sockaddr, (u_char *) pc->sockaddr,
+                             m->socklen, pc->socklen)
+                == 0)
+            {
+                if (--m->spare == 0) {
+                    ngx_queue_remove(q);
+                    m->listed = 0;
+                }
+
+                ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
+                               "get keepalive peer: using shared connection %p",
+                               m->connection);
+
+                pc->connection = m->connection;
+                pc->cached = 1;
+
+                return NGX_DONE;
+            }
+        }
     }
 
     /* search cache for suitable connection */
@@ -234,6 +294,10 @@ ngx_http_upstream_get_keepalive_peer(ngx_peer_connection_t *pc, void *data)
         c = item->connection;
 
         if (kp->conf->local && item->tag != kp->upstream->conf) {
+            continue;
+        }
+
+        if (item->multiplex != kp->upstream->multiplex) {
             continue;
         }
 
@@ -279,9 +343,7 @@ ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc, void *data,
     ngx_uint_t state)
 {
     ngx_http_upstream_keepalive_peer_data_t  *kp = data;
-    ngx_http_upstream_keepalive_cache_t      *item;
 
-    ngx_queue_t          *q;
     ngx_connection_t     *c;
     ngx_http_upstream_t  *u;
 
@@ -295,45 +357,65 @@ ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc, void *data,
 
     if (state & NGX_PEER_FAILED
         || c == NULL
-        || c->read->eof
-        || c->read->error
-        || c->read->timedout
-        || c->write->error
-        || c->write->timedout)
+        || !u->keepalive
+        || !u->request_body_sent)
     {
-        goto invalid;
-    }
-
-    if (c->requests >= kp->conf->requests) {
-        goto invalid;
-    }
-
-    if (ngx_current_msec - c->start_time > kp->conf->time) {
-        goto invalid;
-    }
-
-    if (!u->keepalive) {
-        goto invalid;
-    }
-
-    if (!u->request_body_sent) {
-        goto invalid;
-    }
-
-    if (ngx_terminate || ngx_exiting) {
-        goto invalid;
-    }
-
-    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
         goto invalid;
     }
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, pc->log, 0,
                    "free keepalive peer: saving connection %p", c);
 
-    if (ngx_queue_empty(&kp->conf->free)) {
+    if (ngx_http_upstream_keepalive_cache(kp->conf, c,
+                                          (ngx_sockaddr_t *) pc->sockaddr,
+                                          pc->socklen, u->conf, u->multiplex)
+        == NGX_OK)
+    {
+        pc->connection = NULL;
+    }
 
-        q = ngx_queue_last(&kp->conf->cache);
+invalid:
+
+    kp->original_free_peer(pc, kp->data, state);
+}
+
+
+static ngx_int_t
+ngx_http_upstream_keepalive_cache(ngx_http_upstream_keepalive_srv_conf_t *kcf,
+    ngx_connection_t *c, ngx_sockaddr_t *sockaddr, socklen_t socklen,
+    void *tag, ngx_uint_t multiplex)
+{
+    ngx_queue_t                          *q;
+    ngx_http_upstream_keepalive_cache_t  *item;
+
+    if (c->read->eof
+        || c->read->error
+        || c->read->timedout
+        || c->write->error
+        || c->write->timedout)
+    {
+        return NGX_DECLINED;
+    }
+
+    if (c->requests >= kcf->requests) {
+        return NGX_DECLINED;
+    }
+
+    if (ngx_current_msec - c->start_time > kcf->time) {
+        return NGX_DECLINED;
+    }
+
+    if (ngx_terminate || ngx_exiting) {
+        return NGX_DECLINED;
+    }
+
+    if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        return NGX_DECLINED;
+    }
+
+    if (ngx_queue_empty(&kcf->free)) {
+
+        q = ngx_queue_last(&kcf->cache);
         ngx_queue_remove(q);
 
         item = ngx_queue_data(q, ngx_http_upstream_keepalive_cache_t, queue);
@@ -341,21 +423,20 @@ ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc, void *data,
         ngx_http_upstream_keepalive_close(item->connection);
 
     } else {
-        q = ngx_queue_head(&kp->conf->free);
+        q = ngx_queue_head(&kcf->free);
         ngx_queue_remove(q);
 
         item = ngx_queue_data(q, ngx_http_upstream_keepalive_cache_t, queue);
     }
 
-    ngx_queue_insert_head(&kp->conf->cache, q);
+    ngx_queue_insert_head(&kcf->cache, q);
 
     item->connection = c;
-    item->tag = u->conf;
-
-    pc->connection = NULL;
+    item->tag = tag;
+    item->multiplex = multiplex;
 
     c->read->delayed = 0;
-    ngx_add_timer(c->read, kp->conf->timeout);
+    ngx_add_timer(c->read, kcf->timeout);
 
     if (c->write->timer_set) {
         ngx_del_timer(c->write);
@@ -371,16 +452,85 @@ ngx_http_upstream_free_keepalive_peer(ngx_peer_connection_t *pc, void *data,
     c->write->log = ngx_cycle->log;
     c->pool->log = ngx_cycle->log;
 
-    item->socklen = pc->socklen;
-    ngx_memcpy(&item->sockaddr, pc->sockaddr, pc->socklen);
+    item->socklen = socklen;
+    ngx_memcpy(&item->sockaddr, sockaddr, socklen);
+
+    /* the connection can be closed here */
 
     if (c->read->ready) {
         ngx_http_upstream_keepalive_close_handler(c->read);
     }
 
-invalid:
+    return NGX_OK;
+}
 
-    kp->original_free_peer(pc, kp->data, state);
+
+ngx_int_t
+ngx_http_upstream_keepalive_shared_add(ngx_peer_connection_t *pc,
+    ngx_http_upstream_keepalive_shared_t *m, ngx_uint_t spare)
+{
+    ngx_http_upstream_keepalive_peer_data_t  *kp;
+
+    if (pc->get != ngx_http_upstream_get_keepalive_peer) {
+        return NGX_DECLINED;
+    }
+
+    kp = pc->data;
+
+    m->conf = kp->conf;
+    m->connection = pc->connection;
+    m->tag = kp->upstream->conf;
+    m->socklen = pc->socklen;
+    ngx_memcpy(&m->sockaddr, pc->sockaddr, pc->socklen);
+    m->listed = 0;
+
+    ngx_http_upstream_keepalive_shared_update(m, spare);
+
+    return NGX_OK;
+}
+
+
+void
+ngx_http_upstream_keepalive_shared_update(
+    ngx_http_upstream_keepalive_shared_t *m, ngx_uint_t spare)
+{
+    ngx_http_upstream_keepalive_srv_conf_t  *kcf;
+
+    kcf = m->conf;
+    m->spare = spare;
+
+    if (spare && !m->listed) {
+        ngx_queue_insert_head(&kcf->shared, &m->queue);
+        m->listed = 1;
+
+    } else if (spare == 0 && m->listed) {
+        ngx_queue_remove(&m->queue);
+        m->listed = 0;
+    }
+}
+
+
+ngx_int_t
+ngx_http_upstream_keepalive_shared_idle(ngx_http_upstream_keepalive_shared_t *m)
+{
+    ngx_http_upstream_keepalive_shared_remove(m);
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, m->connection->log, 0,
+                   "keepalive idle shared connection %p", m->connection);
+
+    return ngx_http_upstream_keepalive_cache(m->conf, m->connection,
+                                             &m->sockaddr, m->socklen,
+                                             m->tag, 1);
+}
+
+
+void
+ngx_http_upstream_keepalive_shared_remove(
+    ngx_http_upstream_keepalive_shared_t *m)
+{
+    if (m->conf) {
+        ngx_http_upstream_keepalive_shared_update(m, 0);
+    }
 }
 
 
@@ -572,6 +722,7 @@ ngx_http_upstream_keepalive_init_main_conf(ngx_conf_t *cf, void *conf)
 
         ngx_queue_init(&kcf->cache);
         ngx_queue_init(&kcf->free);
+        ngx_queue_init(&kcf->shared);
 
         for (j = 0; j < kcf->max_cached; j++) {
             ngx_queue_insert_head(&kcf->free, &cached[j].queue);
