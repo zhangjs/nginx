@@ -18,6 +18,8 @@
 #define NGX_HTTP_PROXY_V2_DATA_QUEUE_SIZE   NGX_HTTP_V2_DEFAULT_WINDOW
 #define NGX_HTTP_PROXY_V2_MAX_STREAM_ID     0x7fffffff
 
+#define NGX_HTTP_PROXY_V2_CANCEL            0x8
+
 
 typedef enum {
     ngx_http_proxy_v2_st_start = 0,
@@ -272,6 +274,8 @@ static void ngx_http_proxy_v2_ssl_save_session(ngx_connection_t *c);
 #endif
 static ngx_int_t ngx_http_proxy_v2_body_output_filter(void *data,
     ngx_chain_t *in);
+static ngx_chain_t **ngx_http_proxy_v2_borrow_control(ngx_http_request_t *r,
+    ngx_http_proxy_v2_session_t *sess, ngx_chain_t **ll, ngx_chain_t **control);
 static ngx_int_t ngx_http_proxy_v2_flush_output(ngx_http_request_t *r,
     ngx_http_proxy_v2_stream_t *stream, ngx_chain_t *out, ngx_chain_t *control);
 static ngx_uint_t ngx_http_proxy_v2_output_pending(
@@ -289,6 +293,8 @@ static ngx_uint_t ngx_http_proxy_v2_stream_output_done(
 static ngx_uint_t ngx_http_proxy_v2_session_can_keepalive(
     ngx_http_proxy_v2_session_t *sess);
 static ngx_uint_t ngx_http_proxy_v2_can_keepalive(ngx_http_proxy_v2_ctx_t *ctx);
+static ngx_uint_t ngx_http_proxy_v2_close_stream(ngx_http_request_t *r,
+    ngx_http_proxy_v2_stream_t *stream);
 static ngx_int_t ngx_http_proxy_v2_finish_body(ngx_http_request_t *r,
     ngx_http_proxy_v2_ctx_t *ctx);
 static ngx_int_t ngx_http_proxy_v2_process_header(ngx_http_request_t *r);
@@ -361,6 +367,8 @@ static ngx_int_t ngx_http_proxy_v2_send_ping_ack(
     ngx_http_proxy_v2_session_t *sess);
 static ngx_int_t ngx_http_proxy_v2_send_window_update(
     ngx_http_proxy_v2_session_t *sess, ngx_uint_t id, size_t n);
+static ngx_int_t ngx_http_proxy_v2_send_rst_stream(
+    ngx_http_proxy_v2_session_t *sess, ngx_uint_t id, ngx_uint_t error);
 
 static ngx_chain_t *ngx_http_proxy_v2_get_buf(ngx_http_request_t *r,
     ngx_http_proxy_v2_stream_t *stream);
@@ -1412,24 +1420,10 @@ ngx_http_proxy_v2_body_output_filter(void *data, ngx_chain_t *in)
         stream->in = stream->in->next;
     }
 
-    /* borrow control buffers using request-pool links for the writer */
-
-    for (cl = sess->out; cl; cl = cl->next) {
-        ln = ngx_alloc_chain_link(r->pool);
-        if (ln == NULL) {
-            return NGX_ERROR;
-        }
-
-        ln->buf = cl->buf;
-        *ll = ln;
-        ll = &ln->next;
+    ll = ngx_http_proxy_v2_borrow_control(r, sess, ll, &control);
+    if (ll == NULL) {
+        return NGX_ERROR;
     }
-
-    /* retain the session-pool ownership links for separate recycling */
-
-    control = sess->out;
-    sess->out = NULL;
-    sess->last_out = &sess->out;
 
     f = NULL;
     last = 0;
@@ -1682,6 +1676,35 @@ ngx_http_proxy_v2_body_output_filter(void *data, ngx_chain_t *in)
 }
 
 
+static ngx_chain_t **
+ngx_http_proxy_v2_borrow_control(ngx_http_request_t *r,
+    ngx_http_proxy_v2_session_t *sess, ngx_chain_t **ll, ngx_chain_t **control)
+{
+    ngx_chain_t  *cl, *ln;
+
+    /* borrow control buffers using request-pool links for the writer */
+
+    for (cl = sess->out; cl; cl = cl->next) {
+        ln = ngx_alloc_chain_link(r->pool);
+        if (ln == NULL) {
+            return NULL;
+        }
+
+        ln->buf = cl->buf;
+        *ll = ln;
+        ll = &ln->next;
+    }
+
+    /* retain the session-pool ownership links for separate recycling */
+
+    *control = sess->out;
+    sess->out = NULL;
+    sess->last_out = &sess->out;
+
+    return ll;
+}
+
+
 static ngx_int_t
 ngx_http_proxy_v2_flush_output(ngx_http_request_t *r,
     ngx_http_proxy_v2_stream_t *stream, ngx_chain_t *out, ngx_chain_t *control)
@@ -1847,6 +1870,64 @@ ngx_http_proxy_v2_can_keepalive(ngx_http_proxy_v2_ctx_t *ctx)
 }
 
 
+static ngx_uint_t
+ngx_http_proxy_v2_close_stream(ngx_http_request_t *r,
+    ngx_http_proxy_v2_stream_t *stream)
+{
+    ngx_int_t                     rc;
+    ngx_chain_t                  *out, *control, **ll;
+    ngx_connection_t             *c;
+    ngx_http_proxy_v2_session_t  *sess;
+
+    sess = stream->session;
+    c = sess->connection;
+
+    /*
+     * A stream released before it is closed, e.g., on a client abort or
+     * a header-only response, is reset with CANCEL.  The connection is
+     * only kept if this completes synchronously: with no frame partially
+     * written and the reset written at once.
+     */
+
+    if (!ngx_http_proxy_v2_session_can_keepalive(sess)
+        || c->read->timedout || c->write->timedout)
+    {
+        return 0;
+    }
+
+    if (!stream->header_sent
+        || stream->rst_received
+        || (stream->done && stream->output_closed))
+    {
+        /* the stream was never opened, or is already closed */
+        return 1;
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "http proxy cancel stream %ui", stream->id);
+
+    if (ngx_http_proxy_v2_send_rst_stream(sess, stream->id,
+                                          NGX_HTTP_PROXY_V2_CANCEL)
+        != NGX_OK)
+    {
+        return 0;
+    }
+
+    out = NULL;
+
+    ll = ngx_http_proxy_v2_borrow_control(r, sess, &out, &control);
+    if (ll == NULL) {
+        return 0;
+    }
+
+    *ll = NULL;
+
+    rc = ngx_http_proxy_v2_flush_output(r, stream, out, control);
+
+    return rc == NGX_OK && !ngx_http_proxy_v2_output_pending(sess);
+}
+
+
 static ngx_int_t
 ngx_http_proxy_v2_finish_body(ngx_http_request_t *r,
     ngx_http_proxy_v2_ctx_t *ctx)
@@ -1914,20 +1995,13 @@ ngx_http_proxy_v2_finish_body(ngx_http_request_t *r,
          * sent: as with other upstream protocols, stop sending it instead
          * of waiting for the upstream to accept it, which it may never do.
          * Unless the upstream reset the stream with NO_ERROR, the stream
-         * remains open on our side, and the connection is not reused.
+         * remains open on our side, and is cancelled when released, see
+         * ngx_http_proxy_v2_close_stream().
          */
 
         stream->in = NULL;
         stream->output_discarded = 1;
         stream->output_blocked = 0;
-
-        if (!stream->rst_received) {
-            u->keepalive = 0;
-            u->pipe->length = 0;
-            u->length = 0;
-
-            return NGX_DONE;
-        }
     }
 
     u->keepalive = ngx_http_proxy_v2_can_keepalive(ctx);
@@ -4996,6 +5070,47 @@ ngx_http_proxy_v2_send_window_update(ngx_http_proxy_v2_session_t *sess,
 }
 
 
+static ngx_int_t
+ngx_http_proxy_v2_send_rst_stream(ngx_http_proxy_v2_session_t *sess,
+    ngx_uint_t id, ngx_uint_t error)
+{
+    ngx_chain_t                *cl;
+    ngx_http_proxy_v2_frame_t  *f;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, sess->connection->log, 0,
+                   "http proxy send rst stream: stream %ui, error %ui",
+                   id, error);
+
+    cl = ngx_http_proxy_v2_get_control_buf(sess);
+    if (cl == NULL) {
+        return NGX_ERROR;
+    }
+
+    f = (ngx_http_proxy_v2_frame_t *) cl->buf->last;
+    cl->buf->last += sizeof(ngx_http_proxy_v2_frame_t);
+
+    f->length_0 = 0;
+    f->length_1 = 0;
+    f->length_2 = 4;
+    f->type = NGX_HTTP_V2_RST_STREAM_FRAME;
+    f->flags = 0;
+    f->stream_id_0 = (u_char) ((id >> 24) & 0xff);
+    f->stream_id_1 = (u_char) ((id >> 16) & 0xff);
+    f->stream_id_2 = (u_char) ((id >> 8) & 0xff);
+    f->stream_id_3 = (u_char) (id & 0xff);
+
+    *cl->buf->last++ = (u_char) ((error >> 24) & 0xff);
+    *cl->buf->last++ = (u_char) ((error >> 16) & 0xff);
+    *cl->buf->last++ = (u_char) ((error >> 8) & 0xff);
+    *cl->buf->last++ = (u_char) (error & 0xff);
+
+    *sess->last_out = cl;
+    sess->last_out = &cl->next;
+
+    return NGX_OK;
+}
+
+
 static ngx_chain_t *
 ngx_http_proxy_v2_get_buf(ngx_http_request_t *r,
     ngx_http_proxy_v2_stream_t *stream)
@@ -5254,13 +5369,17 @@ ngx_http_proxy_v2_free_connection(ngx_http_request_t *r, ngx_http_upstream_t *u,
     u->keepalive = (rc == 0 || rc == NGX_AGAIN)
                    && ngx_http_proxy_v2_can_keepalive(ctx);
 
+    if (!u->keepalive) {
+        u->keepalive = ngx_http_proxy_v2_close_stream(r, stream);
+    }
+
     /*
-     * After a reset with NO_ERROR, the rest of the request body is not
-     * needed: the connection can be kept alive, though the body was not
-     * sent in full, which the keepalive module checks.
+     * The stream is closed: the connection can be kept alive, though the
+     * request body might not have been sent in full, which the keepalive
+     * module checks.
      */
 
-    if (u->keepalive && stream->output_discarded) {
+    if (u->keepalive) {
         u->request_body_sent = 1;
     }
 
