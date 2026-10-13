@@ -18,6 +18,8 @@
 #define NGX_HTTP_PROXY_V2_DATA_QUEUE_SIZE   NGX_HTTP_V2_DEFAULT_WINDOW
 #define NGX_HTTP_PROXY_V2_MAX_STREAM_ID     0x7fffffff
 
+#define NGX_HTTP_PROXY_V2_NO_ERROR          0x0
+#define NGX_HTTP_PROXY_V2_REFUSED_STREAM    0x7
 #define NGX_HTTP_PROXY_V2_CANCEL            0x8
 
 
@@ -129,6 +131,7 @@ typedef struct {
     ngx_uint_t                     setting_id;
     ngx_uint_t                     setting_value;
     ngx_uint_t                     goaway_last_stream_id;
+    ngx_uint_t                     goaway_id;
     ngx_uint_t                     goaway_error;
     u_char                         ping_data[8];
 
@@ -205,6 +208,10 @@ struct ngx_http_proxy_v2_stream_s {
     unsigned                            headers_parsed:1;
     unsigned                            rst_parsed:1;
     unsigned                            rst_received:1;
+    unsigned                            unprocessed:1;
+
+    /* not processed on a graceful shutdown: not a peer failure */
+    unsigned                            graceful:1;
 };
 
 
@@ -1286,6 +1293,8 @@ ngx_http_proxy_v2_reinit_request(ngx_http_request_t *r)
     ctx->stream.headers_parsed = 0;
     ctx->stream.rst_parsed = 0;
     ctx->stream.rst_received = 0;
+    ctx->stream.unprocessed = 0;
+    ctx->stream.graceful = 0;
     ctx->stream.rst_received_error = 0;
     ctx->stream.data = NULL;
     ctx->stream.data_last = &ctx->stream.data;
@@ -1343,6 +1352,7 @@ ngx_http_proxy_v2_body_output_filter(void *data, ngx_chain_t *in)
 
     if (sess->read_status == NGX_ERROR
         || sess->read_status == NGX_HTTP_UPSTREAM_INVALID_HEADER
+        || stream->unprocessed
         || (stream->rst_received
             && (stream->rst_received_error || !stream->done)))
     {
@@ -3005,6 +3015,7 @@ ngx_http_proxy_v2_process_connection_frame(ngx_http_proxy_v2_session_t *sess,
 {
     ssize_t                      window_update;
     ngx_int_t                    rc;
+    ngx_uint_t                   graceful;
     ngx_http_proxy_v2_stream_t  *stream;
 
     if (sess->type == NGX_HTTP_V2_GOAWAY_FRAME) {
@@ -3020,12 +3031,21 @@ ngx_http_proxy_v2_process_connection_frame(ngx_http_proxy_v2_session_t *sess,
         }
 
         /*
-         * Streams above last_stream_id need to be retried.  Preserve the
-         * connection failure path while requests are attached one at a time.
-         * A session with no affected streams can drain normally.
+         * Streams above last_stream_id were not processed and can be
+         * retried (RFC 9113, Section 6.8), while the others can complete.
+         * The session is not reused.  The last stream identifier
+         * can only decrease with subsequent GOAWAY frames.
          */
 
+        if (!sess->goaway || sess->goaway_id < sess->goaway_last_stream_id) {
+            sess->goaway_last_stream_id = sess->goaway_id;
+        }
+
         sess->goaway = 1;
+
+        /* the first GOAWAY not processing a stream decides its outcome */
+
+        graceful = (sess->goaway_error == NGX_HTTP_PROXY_V2_NO_ERROR);
 
         for (stream = ngx_http_proxy_v2_first_stream(sess);
              stream;
@@ -3035,13 +3055,20 @@ ngx_http_proxy_v2_process_connection_frame(ngx_http_proxy_v2_session_t *sess,
                 continue;
             }
 
-            /* TODO: we can retry non-idempotent requests */
-
             ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
-                          "upstream sent goaway with error %ui",
-                          sess->goaway_error);
+                          "upstream sent goaway with error %ui, "
+                          "stream %ui not processed",
+                          sess->goaway_error, stream->id);
 
-            return NGX_ERROR;
+            if (stream->headers_parsed || stream->headers) {
+                /* a response was sent on the stream */
+                return NGX_ERROR;
+            }
+
+            if (!stream->unprocessed) {
+                stream->unprocessed = 1;
+                stream->graceful = graceful;
+            }
         }
 
         return NGX_OK;
@@ -3268,6 +3295,19 @@ ngx_http_proxy_v2_stream_process_frame(ngx_http_proxy_v2_stream_t *stream,
         /* close the stream before publishing the reset to the request */
 
         stream->rst_received = 1;
+
+        if (stream->rst_received_error == NGX_HTTP_PROXY_V2_REFUSED_STREAM
+            && !stream->headers_parsed && stream->headers == NULL)
+        {
+            /* the request was not processed (RFC 9113, Section 8.7) */
+
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "upstream refused stream %ui", stream->id);
+
+            stream->unprocessed = 1;
+            return NGX_OK;
+        }
+
         stream->rst_parsed = 1;
         return NGX_OK;
 
@@ -4651,22 +4691,22 @@ ngx_http_proxy_v2_parse_goaway(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
         switch (state) {
 
         case sw_start:
-            sess->goaway_last_stream_id = (ch & 0x7f) << 24;
+            sess->goaway_id = (ch & 0x7f) << 24;
             state = sw_last_stream_id_2;
             break;
 
         case sw_last_stream_id_2:
-            sess->goaway_last_stream_id |= ch << 16;
+            sess->goaway_id |= ch << 16;
             state = sw_last_stream_id_3;
             break;
 
         case sw_last_stream_id_3:
-            sess->goaway_last_stream_id |= ch << 8;
+            sess->goaway_id |= ch << 8;
             state = sw_last_stream_id_4;
             break;
 
         case sw_last_stream_id_4:
-            sess->goaway_last_stream_id |= ch;
+            sess->goaway_id |= ch;
             state = sw_error;
             break;
 
@@ -4705,7 +4745,7 @@ ngx_http_proxy_v2_parse_goaway(ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b)
 
     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, sess->connection->log, 0,
                    "http proxy goaway: %ui, stream %ui",
-                   sess->goaway_error, sess->goaway_last_stream_id);
+                   sess->goaway_error, sess->goaway_id);
 
     sess->state = ngx_http_proxy_v2_st_start;
 
@@ -5360,6 +5400,14 @@ ngx_http_proxy_v2_free_connection(ngx_http_request_t *r, ngx_http_upstream_t *u,
     c->read->timedout |= sc->read->timedout && !sc->read->delayed;
     c->write->timedout |= sc->write->timedout && !sc->write->delayed;
 
+    if (stream->unprocessed) {
+        u->unprocessed = 1;
+
+        /* a refused stream or a graceful shutdown is not a peer failure */
+
+        u->skip_peer_failure = stream->rst_received || stream->graceful;
+    }
+
     /*
      * A header-only response is finalized before its body processing is
      * started, so the decision is made here from the stream state rather
@@ -5838,12 +5886,12 @@ ngx_http_proxy_v2_update_read_event(ngx_http_proxy_v2_stream_t *stream)
     }
 
     ev->ready = stream->headers || stream->data_size || stream->trailers
-                || stream->rst_parsed || stream->done
+                || stream->rst_parsed || stream->done || stream->unprocessed
                 || sess->read_status != NGX_OK;
 
     /* let queued headers and resets reach process_header() before errors */
 
-    ev->error = sess->read_status == NGX_ERROR
+    ev->error = (sess->read_status == NGX_ERROR || stream->unprocessed)
                 && stream->headers == NULL && !stream->rst_parsed;
 
     /* the transport end is seen by the request after queued input */
