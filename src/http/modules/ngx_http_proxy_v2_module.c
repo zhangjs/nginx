@@ -196,6 +196,13 @@ typedef struct {
     unsigned                              shared:1;
     unsigned                              quiescing:1;
 
+    /* a stream of a shared session timed out: no new streams */
+    unsigned                              suspect_read:1;
+    unsigned                              suspect_write:1;
+
+    /* a failure of the session was reported for a stream */
+    unsigned                              failure_reported:1;
+
     /* replays header frames stored in a cache file, without a connection */
     unsigned                              cached:1;
 } ngx_http_proxy_v2_session_t;
@@ -1576,6 +1583,10 @@ ngx_http_proxy_v2_session_write(ngx_http_proxy_v2_session_t *sess)
         }
 
         ngx_http_proxy_v2_wire_complete(sess, chain);
+
+        if (c->sent != sent) {
+            sess->suspect_write = 0;
+        }
 
         if (chain || c->buffered) {
 
@@ -6116,11 +6127,54 @@ ngx_http_proxy_v2_release_shared(ngx_http_request_t *r,
 
     /*
      * The session keeps the transport.  Timeouts of a stream are local
-     * to it, and are not propagated to the transport.
+     * to it, and are not propagated to the transport; still, the session
+     * is not used for new streams until it is shown to be alive: some
+     * input is received after a read timeout, or some output is written
+     * after a send timeout.  Both directions are tracked separately, as
+     * an upstream can send while not reading.
      */
 
     u->peer.connection = NULL;
     u->keepalive = 0;
+
+    if (stream->read.timedout && !stream->read.delayed
+        && !sess->suspect_read)
+    {
+        ngx_log_error(NGX_LOG_INFO, sess->connection->log, 0,
+                      "new requests are not sent after a read timeout");
+
+        sess->suspect_read = 1;
+    }
+
+    if (stream->write.timedout && !stream->write.delayed
+        && !sess->suspect_write)
+    {
+        ngx_log_error(NGX_LOG_INFO, sess->connection->log, 0,
+                      "new requests are not sent after a send timeout");
+
+        sess->suspect_write = 1;
+    }
+
+    /*
+     * A failure of the session is reported to the balancer once, for the
+     * first stream which failed because of it.  A stream with an outcome
+     * of its own, such as a reset or a graceful shutdown, is not one.
+     */
+
+    if ((sess->connection->error
+         || sess->read_status != NGX_OK
+         || stream->unprocessed)
+        && !u->skip_peer_failure
+        && !stream->rst_received
+        && (!stream->done || stream->failed))
+    {
+        if (sess->failure_reported) {
+            u->skip_peer_failure = 1;
+
+        } else {
+            sess->failure_reported = 1;
+        }
+    }
 
     rc = ngx_http_proxy_v2_wire_detach(sess, stream);
 
@@ -6220,7 +6274,9 @@ ngx_http_proxy_v2_session_idle(ngx_http_proxy_v2_session_t *sess)
             }
         }
 
-        idle = !sess->goaway && ngx_http_proxy_v2_session_can_keepalive(sess);
+        idle = !sess->goaway
+               && !sess->suspect_read && !sess->suspect_write
+               && ngx_http_proxy_v2_session_can_keepalive(sess);
     }
 
     if (sess->deadline.timer_set) {
@@ -6455,7 +6511,9 @@ ngx_http_proxy_v2_session_spare(ngx_http_proxy_v2_session_t *sess)
     if (!sess->shared
         || sess->connection->error
         || sess->read_status != NGX_OK
-        || sess->goaway)
+        || sess->goaway
+        || sess->suspect_read
+        || sess->suspect_write)
     {
         return 0;
     }
@@ -6771,6 +6829,7 @@ ngx_http_proxy_v2_session_read_handler(ngx_event_t *ev)
         }
 
         sess->received += n;
+        sess->suspect_read = 0;
         b->last += n;
         read += n;
     }
