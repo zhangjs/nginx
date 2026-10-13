@@ -271,6 +271,14 @@ ngx_handle_read_event(ngx_event_t *rev, ngx_uint_t flags)
 
     ngx_connection_t  *c;
 
+#endif
+
+    if (rev->virtual) {
+        return NGX_OK;
+    }
+
+#if (NGX_QUIC)
+
     c = rev->data;
 
     if (c->quic) {
@@ -348,6 +356,10 @@ ngx_int_t
 ngx_handle_write_event(ngx_event_t *wev, size_t lowat)
 {
     ngx_connection_t  *c;
+
+    if (wev->virtual) {
+        return NGX_OK;
+    }
 
     c = wev->data;
 

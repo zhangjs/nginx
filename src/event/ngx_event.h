@@ -43,6 +43,9 @@ struct ngx_event_s {
      */
     unsigned         active:1;
 
+    /* posted events and timers only, without a kernel event registration */
+    unsigned         virtual:1;
+
     unsigned         disabled:1;
 
     /* the ready event; in aio mode 0 means that no operation can be posted */
