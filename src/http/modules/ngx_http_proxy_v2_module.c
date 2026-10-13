@@ -1415,7 +1415,7 @@ ngx_http_proxy_v2_body_output_filter(void *data, ngx_chain_t *in)
             u->keepalive = 1;
         }
 
-        ngx_post_event(u->peer.connection->read, &ngx_posted_events);
+        ngx_post_event(u->connection->read, &ngx_posted_events);
     }
 
     return rc;
@@ -2048,7 +2048,7 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
         }
 
         if (ctx->in) {
-            ngx_post_event(u->peer.connection->write, &ngx_posted_events);
+            ngx_post_event(u->connection->write, &ngx_posted_events);
         }
 
         return NGX_OK;
@@ -2067,7 +2067,7 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
         }
 
         if (ctx->in) {
-            ngx_post_event(u->peer.connection->write, &ngx_posted_events);
+            ngx_post_event(u->connection->write, &ngx_posted_events);
         }
 
         return NGX_OK;
@@ -2085,7 +2085,7 @@ ngx_http_proxy_v2_process_control_frame(ngx_http_request_t *r,
             return NGX_ERROR;
         }
 
-        ngx_post_event(u->peer.connection->write, &ngx_posted_events);
+        ngx_post_event(u->connection->write, &ngx_posted_events);
 
         return NGX_OK;
     }
@@ -2150,7 +2150,7 @@ ngx_http_proxy_v2_process_frames(ngx_http_request_t *r,
                      */
 
                     if (ctx->out) {
-                        ngx_post_event(u->peer.connection->write,
+                        ngx_post_event(u->connection->write,
                                        &ngx_posted_events);
                         return NGX_AGAIN;
                     }
@@ -2223,7 +2223,7 @@ ngx_http_proxy_v2_process_frames(ngx_http_request_t *r,
                         return NGX_ERROR;
                     }
 
-                    ngx_post_event(u->peer.connection->write,
+                    ngx_post_event(u->connection->write,
                                    &ngx_posted_events);
                 }
             }

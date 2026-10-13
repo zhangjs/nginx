@@ -345,6 +345,8 @@ struct ngx_http_upstream_s {
 
     ngx_peer_connection_t            peer;
 
+    ngx_connection_t                *connection;
+
     ngx_event_pipe_t                *pipe;
 
     ngx_chain_t                     *request_bufs;
