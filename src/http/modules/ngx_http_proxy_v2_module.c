@@ -106,6 +106,9 @@ struct ngx_http_proxy_v2_header_block_s {
 typedef struct {
     ngx_connection_t              *connection;
 
+    /* attached streams, in order, and the index of committed ones */
+    ngx_queue_t                    attached;
+    ngx_uint_t                     seq;
     ngx_rbtree_t                   streams;
     ngx_rbtree_node_t              sentinel;
 
@@ -171,6 +174,8 @@ struct ngx_http_proxy_v2_stream_s {
     ngx_event_t                         read;
     ngx_event_t                         write;
 
+    ngx_queue_t                         queue;
+    ngx_uint_t                          seq;
     ngx_rbtree_node_t                   node;
 
     ngx_uint_t                          fragment_state;
@@ -233,7 +238,7 @@ struct ngx_http_proxy_v2_stream_s {
     unsigned                            rst_received:1;
     unsigned                            unprocessed:1;
 
-    /* not processed on a graceful shutdown: not a peer failure */
+    /* not processed, without a failure of the upstream */
     unsigned                            graceful:1;
 };
 
@@ -1546,7 +1551,7 @@ ngx_http_proxy_v2_compose(ngx_http_proxy_v2_session_t *sess)
 
         stream = ngx_http_proxy_v2_first_stream(sess);
 
-        while (stream && stream->id < sess->cursor) {
+        while (stream && stream->seq < sess->cursor) {
             stream = ngx_http_proxy_v2_next_stream(stream);
         }
 
@@ -1564,7 +1569,7 @@ ngx_http_proxy_v2_compose(ngx_http_proxy_v2_session_t *sess)
             }
 
             if (sess->wire_size >= NGX_HTTP_PROXY_V2_WRITE_BATCH) {
-                sess->cursor = next ? next->id : 0;
+                sess->cursor = next ? next->seq : 0;
                 return NGX_OK;
             }
         }
@@ -1589,13 +1594,37 @@ ngx_http_proxy_v2_compose_stream(ngx_http_proxy_v2_session_t *sess,
     ngx_chain_t                *cl, *ln;
     ngx_http_proxy_v2_frame_t  *f;
 
-    if (stream->in == NULL || stream->rst_received) {
+    if (stream->in == NULL || stream->unprocessed || stream->rst_received) {
         return NGX_DECLINED;
     }
 
     if (stream->header_sent) {
         return ngx_http_proxy_v2_compose_data(sess, stream);
     }
+
+    /*
+     * The stream identifier is allocated when the header block is
+     * composed, so that identifiers increase in the order streams are
+     * opened on the wire (RFC 9113, Section 5.1.1).
+     */
+
+    if (sess->last_stream_id > NGX_HTTP_PROXY_V2_MAX_STREAM_ID - 2) {
+        ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+                      "no more http2 stream identifiers");
+
+        /* the request is retried with another connection */
+
+        stream->unprocessed = 1;
+        stream->graceful = 1;
+        ngx_http_proxy_v2_notify_read(stream);
+        return NGX_DECLINED;
+    }
+
+    stream->id = sess->last_stream_id ? sess->last_stream_id + 2 : 1;
+    sess->last_stream_id = stream->id;
+
+    stream->node.key = stream->id;
+    ngx_rbtree_insert(&sess->streams, &stream->node);
 
     /* the first buffer contains the header block, an atomic unit */
 
@@ -2271,6 +2300,7 @@ ngx_http_proxy_v2_process_cached_header(ngx_http_request_t *r)
         sess->connection = r->connection;
         sess->cached = 1;
 
+        ngx_queue_init(&sess->attached);
         ngx_rbtree_init(&sess->streams, &sess->sentinel,
                         ngx_rbtree_insert_value);
 
@@ -2279,6 +2309,7 @@ ngx_http_proxy_v2_process_cached_header(ngx_http_request_t *r)
         stream->id = ((ngx_uint_t) (p[5] & 0x7f) << 24)
                      | (p[6] << 16) | (p[7] << 8) | p[8];
 
+        ngx_queue_insert_tail(&sess->attached, &stream->queue);
         stream->node.key = stream->id;
         ngx_rbtree_insert(&sess->streams, &stream->node);
         stream->session = sess;
@@ -3196,6 +3227,18 @@ ngx_http_proxy_v2_process_connection_frame(ngx_http_proxy_v2_session_t *sess,
              stream;
              stream = ngx_http_proxy_v2_next_stream(stream))
         {
+            if (stream->id == 0) {
+
+                /* the stream will not be opened */
+
+                if (!stream->unprocessed) {
+                    stream->unprocessed = 1;
+                    stream->graceful = graceful;
+                }
+
+                continue;
+            }
+
             if (sess->goaway_last_stream_id >= stream->id) {
                 continue;
             }
@@ -6390,6 +6433,7 @@ ngx_http_proxy_v2_get_session(ngx_peer_connection_t *pc)
     ngx_memzero(sess, sizeof(ngx_http_proxy_v2_session_t));
     sess->connection = c;
 
+    ngx_queue_init(&sess->attached);
     ngx_rbtree_init(&sess->streams, &sess->sentinel,
                     ngx_rbtree_insert_value);
 
@@ -6464,32 +6508,27 @@ ngx_http_proxy_v2_find_stream(ngx_http_proxy_v2_session_t *sess, ngx_uint_t id)
 static ngx_http_proxy_v2_stream_t *
 ngx_http_proxy_v2_first_stream(ngx_http_proxy_v2_session_t *sess)
 {
-    ngx_rbtree_node_t  *node;
-
-    node = sess->streams.root;
-
-    if (node == sess->streams.sentinel) {
+    if (ngx_queue_empty(&sess->attached)) {
         return NULL;
     }
 
-    node = ngx_rbtree_min(node, sess->streams.sentinel);
-
-    return ngx_rbtree_data(node, ngx_http_proxy_v2_stream_t, node);
+    return ngx_queue_data(ngx_queue_head(&sess->attached),
+                          ngx_http_proxy_v2_stream_t, queue);
 }
 
 
 static ngx_http_proxy_v2_stream_t *
 ngx_http_proxy_v2_next_stream(ngx_http_proxy_v2_stream_t *stream)
 {
-    ngx_rbtree_node_t  *node;
+    ngx_queue_t  *q;
 
-    node = ngx_rbtree_next(&stream->session->streams, &stream->node);
+    q = ngx_queue_next(&stream->queue);
 
-    if (node) {
-        return ngx_rbtree_data(node, ngx_http_proxy_v2_stream_t, node);
+    if (q == ngx_queue_sentinel(&stream->session->attached)) {
+        return NULL;
     }
 
-    return NULL;
+    return ngx_queue_data(q, ngx_http_proxy_v2_stream_t, queue);
 }
 
 
@@ -6499,7 +6538,7 @@ ngx_http_proxy_v2_attach_stream(ngx_http_proxy_v2_session_t *sess,
 {
     /* requests are still attached one at a time */
 
-    if (sess->streams.root != sess->streams.sentinel
+    if (!ngx_queue_empty(&sess->attached)
         || ngx_http_proxy_v2_output_pending(sess)
         || sess->read_status != NGX_OK
         || sess->buffer.pos != sess->buffer.last
@@ -6510,8 +6549,10 @@ ngx_http_proxy_v2_attach_stream(ngx_http_proxy_v2_session_t *sess,
         return NGX_ERROR;
     }
 
-    stream->id = sess->last_stream_id ? sess->last_stream_id + 2 : 1;
-    sess->last_stream_id = stream->id;
+    /* the identifier is allocated when the stream is opened */
+
+    stream->id = 0;
+    stream->seq = ++sess->seq;
 
     stream->send_window = sess->init_window;
     stream->recv_window = NGX_HTTP_V2_MAX_WINDOW;
@@ -6519,8 +6560,7 @@ ngx_http_proxy_v2_attach_stream(ngx_http_proxy_v2_session_t *sess,
     stream->received_start = sess->received;
     stream->received = 0;
 
-    stream->node.key = stream->id;
-    ngx_rbtree_insert(&sess->streams, &stream->node);
+    ngx_queue_insert_tail(&sess->attached, &stream->queue);
 
     stream->session = sess;
 
@@ -6539,7 +6579,11 @@ ngx_http_proxy_v2_detach_stream(ngx_http_proxy_v2_stream_t *stream)
 
     /* remove request-pool storage from the session before releasing it */
 
-    ngx_rbtree_delete(&sess->streams, &stream->node);
+    if (stream->id) {
+        ngx_rbtree_delete(&sess->streams, &stream->node);
+    }
+
+    ngx_queue_remove(&stream->queue);
 
     ngx_http_proxy_v2_clear_event(&stream->read);
     ngx_http_proxy_v2_clear_event(&stream->write);
@@ -6564,7 +6608,7 @@ ngx_http_proxy_v2_cleanup(void *data)
 
     ngx_http_proxy_v2_stream_t  *stream;
 
-    if (sess->streams.root == sess->streams.sentinel) {
+    if (ngx_queue_empty(&sess->attached)) {
         return;
     }
 
