@@ -50,6 +50,11 @@ typedef struct {
 
     ngx_chain_writer_ctx_t         writer;
     ngx_buf_t                      preface;
+    size_t                         send_lowat;
+
+#if (NGX_HTTP_SSL)
+    ngx_connection_handler_pt      original_save_session;
+#endif
 
     ngx_chain_t                   *out;
     ngx_chain_t                  **last_out;
@@ -84,6 +89,10 @@ typedef struct {
 
 
 struct ngx_http_proxy_v2_stream_s {
+    ngx_connection_t                    connection;
+    ngx_event_t                         read;
+    ngx_event_t                         write;
+
     ngx_uint_t                          fragment_state;
 
     ngx_chain_t                        *in;
@@ -154,6 +163,21 @@ static ngx_int_t ngx_http_proxy_v2_init_connection(ngx_http_request_t *r,
     ngx_http_upstream_t *u);
 static void ngx_http_proxy_v2_free_connection(ngx_http_request_t *r,
     ngx_http_upstream_t *u, ngx_int_t rc);
+static void ngx_http_proxy_v2_session_handler(ngx_event_t *ev);
+static ngx_int_t ngx_http_proxy_v2_session_handle_events(
+    ngx_http_proxy_v2_session_t *sess);
+static void ngx_http_proxy_v2_update_stream_connection(
+    ngx_http_proxy_v2_stream_t *stream, ngx_uint_t write);
+static ssize_t ngx_http_proxy_v2_recv(ngx_connection_t *c, u_char *buf,
+    size_t size);
+static ssize_t ngx_http_proxy_v2_recv_chain(ngx_connection_t *c,
+    ngx_chain_t *in, off_t limit);
+static ssize_t ngx_http_proxy_v2_handle_recv(ngx_http_proxy_v2_stream_t *stream,
+    ssize_t n);
+static void ngx_http_proxy_v2_clear_event(ngx_event_t *ev);
+#if (NGX_HTTP_SSL)
+static void ngx_http_proxy_v2_ssl_save_session(ngx_connection_t *c);
+#endif
 static ngx_int_t ngx_http_proxy_v2_body_output_filter(void *data,
     ngx_chain_t *in);
 static ngx_int_t ngx_http_proxy_v2_flush_output(ngx_http_request_t *r,
@@ -1156,6 +1180,22 @@ ngx_http_proxy_v2_body_output_filter(void *data, ngx_chain_t *in)
         }
     }
 
+    if (sess->connection->error) {
+        return NGX_ERROR;
+    }
+
+#if (NGX_HTTP_SSL)
+    if (sess->connection->ssl
+        && sess->connection->ssl->saved_write_handler)
+    {
+        /* SSL_read() owns write readiness until its WANT_WRITE is resolved */
+
+        stream->connection.write->ready = 0;
+        stream->output_blocked = 1;
+        return NGX_AGAIN;
+    }
+#endif
+
     out = NULL;
     ll = &out;
 
@@ -1488,6 +1528,13 @@ ngx_http_proxy_v2_flush_output(ngx_http_request_t *r,
     /* the session writer borrows request and control buffers */
 
     rc = ngx_chain_writer(&sess->writer, out);
+
+    if (ngx_http_proxy_v2_session_handle_events(sess) != NGX_OK) {
+        sess->connection->error = 1;
+        rc = NGX_ERROR;
+    }
+
+    ngx_http_proxy_v2_update_stream_connection(stream, 1);
 
     ngx_chain_update_chains(r->pool, &stream->free, &stream->busy, &out,
                          (ngx_buf_tag_t) &ngx_http_proxy_v2_body_output_filter);
@@ -4501,8 +4548,11 @@ ngx_http_proxy_v2_get_ctx(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_proxy_v2_init_connection(ngx_http_request_t *r, ngx_http_upstream_t *u)
 {
+    ngx_connection_t            *c, *sc;
+    ngx_event_t                 *rev, *wev;
     ngx_http_proxy_v2_ctx_t      *ctx;
     ngx_http_core_loc_conf_t     *clcf;
+    ngx_http_proxy_v2_stream_t   *stream;
     ngx_http_proxy_v2_session_t  *sess;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_v2_module);
@@ -4522,6 +4572,96 @@ ngx_http_proxy_v2_init_connection(ngx_http_request_t *r, ngx_http_upstream_t *u)
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
     sess->writer.limit = clcf->sendfile_max_chunk;
+    sess->send_lowat = u->conf->send_lowat;
+
+    c = sess->connection;
+    stream = &ctx->stream;
+    sc = &stream->connection;
+    rev = &stream->read;
+    wev = &stream->write;
+
+    /* each attempt gets its own request I/O state, independent of the peer */
+
+    ngx_memzero(sc, sizeof(ngx_connection_t));
+    ngx_memzero(rev, sizeof(ngx_event_t));
+    ngx_memzero(wev, sizeof(ngx_event_t));
+
+    sc->fd = (ngx_socket_t) -1;
+    sc->data = r;
+    sc->read = rev;
+    sc->write = wev;
+    sc->recv = ngx_http_proxy_v2_recv;
+    sc->recv_chain = ngx_http_proxy_v2_recv_chain;
+    sc->pool = r->pool;
+    sc->log = c->log;
+    sc->type = c->type;
+    sc->number = c->number;
+    sc->start_time = c->start_time;
+    sc->sendfile = c->sendfile;
+    sc->tcp_nodelay = NGX_TCP_NODELAY_DISABLED;
+    sc->tcp_nopush = NGX_TCP_NOPUSH_DISABLED;
+
+    rev->data = sc;
+    rev->log = c->log;
+    rev->handler = ngx_http_empty_handler;
+    rev->virtual = 1;
+    rev->available = -1;
+    rev->index = NGX_INVALID_INDEX;
+
+    /*
+     * A virtual event is never registered in the kernel; it is marked
+     * active so that request I/O code, such as the non-buffered upstream
+     * path, arms read timeouts on it as on a registered event.
+     */
+
+    rev->active = 1;
+
+    *wev = *rev;
+    wev->write = 1;
+
+    /*
+     * The upstream module set its event handler on the peer connection when
+     * connecting; request I/O now goes through the stream connection.
+     * The connect timer, if any, is not needed anymore.
+     */
+
+    rev->handler = c->read->handler;
+    wev->handler = c->write->handler;
+
+    if (c->write->timer_set) {
+        ngx_del_timer(c->write);
+    }
+
+    u->connection = sc;
+
+    c->data = sess;
+    c->read->handler = ngx_http_proxy_v2_session_handler;
+    c->write->handler = ngx_http_proxy_v2_session_handler;
+
+#if (NGX_HTTP_SSL)
+    if (c->ssl) {
+        sess->original_save_session = c->ssl->save_session;
+
+        if (sess->original_save_session) {
+            c->ssl->save_session = ngx_http_proxy_v2_ssl_save_session;
+        }
+    }
+#endif
+
+    ngx_http_proxy_v2_update_stream_connection(stream, 0);
+    ngx_http_proxy_v2_update_stream_connection(stream, 1);
+
+    if (ngx_http_proxy_v2_session_handle_events(sess) != NGX_OK) {
+        c->error = 1;
+        return NGX_ERROR;
+    }
+
+    if (c->read->ready) {
+        ngx_post_event(c->read, &ngx_posted_events);
+    }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "http proxy stream connection %p, peer %p", sc, c);
 
     return NGX_OK;
 }
@@ -4531,6 +4671,7 @@ static void
 ngx_http_proxy_v2_free_connection(ngx_http_request_t *r, ngx_http_upstream_t *u,
     ngx_int_t rc)
 {
+    ngx_connection_t             *c, *sc;
     ngx_http_proxy_v2_session_t  *sess;
 
     /* response filters can reset module contexts before finalization */
@@ -4546,8 +4687,242 @@ ngx_http_proxy_v2_free_connection(ngx_http_request_t *r, ngx_http_upstream_t *u,
         return;
     }
 
+    c = sess->connection;
+    sc = &sess->stream->connection;
+
+    c->error |= sc->error;
+    c->read->error |= sc->read->error;
+    c->read->eof |= sc->read->eof;
+    c->write->error |= sc->write->error;
+
+    /* a rate-limit timer expiration is not an upstream timeout */
+
+    c->read->timedout |= sc->read->timedout && !sc->read->delayed;
+    c->write->timedout |= sc->write->timedout && !sc->write->delayed;
+
+    if (c->error) {
+        u->keepalive = 0;
+    }
+
+#if (NGX_HTTP_SSL)
+    if (c->ssl
+        && (c->ssl->saved_read_handler || c->ssl->saved_write_handler))
+    {
+        u->keepalive = 0;
+    }
+#endif
+
     ngx_http_proxy_v2_detach_stream(sess->stream);
 }
+
+
+static void
+ngx_http_proxy_v2_session_handler(ngx_event_t *ev)
+{
+    ngx_event_t                 *sev;
+    ngx_connection_t            *c;
+    ngx_http_proxy_v2_stream_t   *stream;
+    ngx_http_proxy_v2_session_t  *sess;
+
+    c = ev->data;
+    sess = c->data;
+    stream = sess->stream;
+
+    if (stream == NULL) {
+        return;
+    }
+
+    /* disarm ready level events, including the direction used by SSL shims */
+
+    if (ngx_http_proxy_v2_session_handle_events(sess) != NGX_OK) {
+        c->error = 1;
+    }
+
+    sev = ev->write ? &stream->write : &stream->read;
+
+    /* a posted continuation or an SSL retry need not have ev->ready set */
+
+    sev->ready = 1;
+    ngx_post_event(sev, &ngx_posted_events);
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_session_handle_events(ngx_http_proxy_v2_session_t *sess)
+{
+    ngx_uint_t         flags;
+    ngx_connection_t  *c;
+
+    c = sess->connection;
+    flags = (c->read->eof || c->read->error) ? NGX_CLOSE_EVENT : 0;
+
+    if (ngx_handle_read_event(c->read, flags) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if (ngx_handle_write_event(c->write, sess->send_lowat) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_proxy_v2_update_stream_connection(ngx_http_proxy_v2_stream_t *stream,
+    ngx_uint_t write)
+{
+    ngx_event_t       *ev, *sev;
+    ngx_connection_t  *c, *sc;
+
+    c = stream->session->connection;
+    sc = &stream->connection;
+
+    ev = write ? c->write : c->read;
+    sev = write ? sc->write : sc->read;
+
+    /* an I/O result only consumes readiness for that logical operation */
+
+    sev->ready = ev->ready;
+    sev->eof = ev->eof;
+    sev->error = ev->error;
+    sc->error |= c->error;
+    sc->sent = c->sent;
+    sc->buffered = c->buffered;
+
+    /* keep pending_eof and available on the transport: SSL may have input */
+
+#if (NGX_HTTP_SSL)
+    if (c->ssl
+        && (c->ssl->saved_read_handler || c->ssl->saved_write_handler))
+    {
+        /* only the transport's SSL retry handler can make progress now */
+
+        sev->ready = 0;
+    }
+#endif
+}
+
+
+static ssize_t
+ngx_http_proxy_v2_recv(ngx_connection_t *c, u_char *buf, size_t size)
+{
+    ngx_connection_t           *pc;
+    ngx_http_proxy_v2_stream_t  *stream;
+
+    stream = (ngx_http_proxy_v2_stream_t *)
+              ((u_char *) c - offsetof(ngx_http_proxy_v2_stream_t, connection));
+    pc = stream->session->connection;
+
+    if (pc->error) {
+        c->read->error = 1;
+        return NGX_ERROR;
+    }
+
+#if (NGX_HTTP_SSL)
+    if (pc->ssl && pc->ssl->saved_read_handler) {
+        /* let the pending SSL_write() finish its WANT_READ first */
+
+        c->read->ready = 0;
+        return NGX_AGAIN;
+    }
+#endif
+
+    return ngx_http_proxy_v2_handle_recv(stream, pc->recv(pc, buf, size));
+}
+
+
+static ssize_t
+ngx_http_proxy_v2_recv_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
+{
+    ngx_connection_t           *pc;
+    ngx_http_proxy_v2_stream_t  *stream;
+
+    stream = (ngx_http_proxy_v2_stream_t *)
+              ((u_char *) c - offsetof(ngx_http_proxy_v2_stream_t, connection));
+    pc = stream->session->connection;
+
+    if (pc->error) {
+        c->read->error = 1;
+        return NGX_ERROR;
+    }
+
+#if (NGX_HTTP_SSL)
+    if (pc->ssl && pc->ssl->saved_read_handler) {
+        c->read->ready = 0;
+        return NGX_AGAIN;
+    }
+#endif
+
+    return ngx_http_proxy_v2_handle_recv(stream, pc->recv_chain(pc, in, limit));
+}
+
+
+static ssize_t
+ngx_http_proxy_v2_handle_recv(ngx_http_proxy_v2_stream_t *stream, ssize_t n)
+{
+    if (ngx_http_proxy_v2_session_handle_events(stream->session) != NGX_OK) {
+        stream->session->connection->error = 1;
+
+        if (n > 0) {
+            /* deliver received bytes before reporting the transport error */
+
+            ngx_post_event(&stream->read, &ngx_posted_events);
+
+        } else {
+            n = NGX_ERROR;
+        }
+    }
+
+    ngx_http_proxy_v2_update_stream_connection(stream, 0);
+
+    if (stream->session->connection->error) {
+        stream->read.ready = 1;
+    }
+
+    return n;
+}
+
+
+static void
+ngx_http_proxy_v2_clear_event(ngx_event_t *ev)
+{
+    if (ev->timer_set) {
+        ngx_del_timer(ev);
+    }
+
+    if (ev->posted) {
+        ngx_delete_posted_event(ev);
+    }
+
+    ev->handler = ngx_http_empty_handler;
+}
+
+
+#if (NGX_HTTP_SSL)
+
+static void
+ngx_http_proxy_v2_ssl_save_session(ngx_connection_t *c)
+{
+    ngx_http_request_t           *r;
+    ngx_http_upstream_t          *u;
+    ngx_http_proxy_v2_session_t  *sess;
+
+    sess = c->data;
+
+    if (sess == NULL || sess->stream == NULL) {
+        return;
+    }
+
+    r = sess->stream->connection.data;
+    u = r->upstream;
+
+    ngx_http_set_log_request(r->connection->log, r);
+
+    u->peer.save_session(&u->peer, u->peer.data);
+}
+
+#endif
 
 
 static ngx_http_proxy_v2_session_t *
@@ -4673,9 +5048,32 @@ static void
 ngx_http_proxy_v2_detach_stream(ngx_http_proxy_v2_stream_t *stream)
 {
     ngx_chain_t                  *cl;
+    ngx_connection_t             *c;
     ngx_http_proxy_v2_session_t  *sess;
 
     sess = stream->session;
+    c = sess->connection;
+
+    ngx_http_proxy_v2_clear_event(&stream->read);
+    ngx_http_proxy_v2_clear_event(&stream->write);
+    stream->read.closed = 1;
+    stream->write.closed = 1;
+    stream->connection.data = NULL;
+
+    ngx_http_proxy_v2_clear_event(c->read);
+    ngx_http_proxy_v2_clear_event(c->write);
+    c->data = NULL;
+
+#if (NGX_HTTP_SSL)
+    if (c->ssl) {
+        c->ssl->save_session = sess->original_save_session;
+
+        /* an outstanding SSL retry makes this connection non-reusable */
+
+        c->ssl->saved_read_handler = NULL;
+        c->ssl->saved_write_handler = NULL;
+    }
+#endif
 
     /* drop borrowed writer references without advancing unsent buffers */
 
