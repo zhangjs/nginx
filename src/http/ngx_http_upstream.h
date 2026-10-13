@@ -245,6 +245,12 @@ typedef struct {
     unsigned                         intercept_404:1;
     unsigned                         change_buffering:1;
     unsigned                         preserve_output:1;
+
+    /*
+     * The module supplies header input and read notifications.
+     * Receive errors and EOF are set on connection->read before notification.
+     * process_header() may return NGX_AGAIN to wait for more input.
+     */
     unsigned                         ignore_input:1;
 
 #if (NGX_HTTP_SSL || NGX_COMPAT)
