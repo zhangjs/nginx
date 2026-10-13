@@ -435,6 +435,10 @@ struct ngx_http_upstream_s {
     unsigned                         request_body_blocked:1;
     unsigned                         header_sent:1;
     unsigned                         response_received:1;
+
+    /* set by protocol modules for the current attempt */
+    unsigned                         unprocessed:1;
+    unsigned                         skip_peer_failure:1;
 };
 
 

@@ -1603,6 +1603,9 @@ ngx_http_upstream_connect(ngx_http_request_t *r, ngx_http_upstream_t *u)
     u->state->connect_time = (ngx_msec_t) -1;
     u->state->header_time = (ngx_msec_t) -1;
 
+    u->unprocessed = 0;
+    u->skip_peer_failure = 0;
+
     rc = ngx_event_connect_peer(&u->peer);
 
     u->connection = u->peer.connection;
@@ -4678,6 +4681,9 @@ ngx_http_upstream_next(ngx_http_request_t *r, ngx_http_upstream_t *u,
         {
             state = NGX_PEER_NEXT;
 
+        } else if (u->skip_peer_failure) {
+            state = 0;
+
         } else {
             state = NGX_PEER_FAILED;
         }
@@ -4747,6 +4753,7 @@ ngx_http_upstream_next(ngx_http_request_t *r, ngx_http_upstream_t *u,
     timeout = u->conf->next_upstream_timeout;
 
     if (u->request_sent
+        && !u->unprocessed
         && (r->method & (NGX_HTTP_POST|NGX_HTTP_LOCK|NGX_HTTP_PATCH)))
     {
         ft_type |= NGX_HTTP_UPSTREAM_FT_NON_IDEMPOTENT;
