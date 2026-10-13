@@ -13,6 +13,8 @@
 
 #define NGX_HTTP_PROXY_V2_MAX_CONTROL_BUFS  1000
 #define NGX_HTTP_PROXY_V2_READ_BUFFER_SIZE  65536
+#define NGX_HTTP_PROXY_V2_READ_BUDGET       262144
+#define NGX_HTTP_PROXY_V2_READ_STEPS        64
 #define NGX_HTTP_PROXY_V2_DATA_QUEUE_SIZE   NGX_HTTP_V2_DEFAULT_WINDOW
 
 
@@ -5329,9 +5331,11 @@ ngx_http_proxy_v2_init_stream(ngx_http_proxy_v2_stream_t *stream,
 static void
 ngx_http_proxy_v2_session_read_handler(ngx_event_t *ev)
 {
+    size_t                        read;
     ssize_t                       n;
     ngx_int_t                     rc;
     ngx_buf_t                    *b;
+    ngx_uint_t                    steps;
     ngx_connection_t             *c;
     ngx_http_proxy_v2_stream_t   *stream;
     ngx_http_proxy_v2_session_t  *sess;
@@ -5363,6 +5367,8 @@ ngx_http_proxy_v2_session_read_handler(ngx_event_t *ev)
     }
 
     b = &sess->buffer;
+    read = 0;
+    steps = NGX_HTTP_PROXY_V2_READ_STEPS;
 
     for ( ;; ) {
         /* empty input can still finish a zero-length payload or padding */
@@ -5370,6 +5376,11 @@ ngx_http_proxy_v2_session_read_handler(ngx_event_t *ev)
         rc = ngx_http_proxy_v2_session_process_frame(sess, b);
 
         if (rc == NGX_OK) {
+            if (--steps == 0) {
+                ngx_post_event(ev, &ngx_posted_next_events);
+                break;
+            }
+
             continue;
         }
 
@@ -5399,6 +5410,24 @@ ngx_http_proxy_v2_session_read_handler(ngx_event_t *ev)
             {
                 break;
             }
+        }
+
+        /* yield after a bounded amount of input */
+
+        if (read >= NGX_HTTP_PROXY_V2_READ_BUDGET) {
+#if (NGX_HTTP_SSL)
+            if (c->ssl
+                && (c->ssl->saved_read_handler || c->ssl->saved_write_handler))
+            {
+                break;
+            }
+#endif
+
+            if (ev->ready) {
+                ngx_post_event(ev, &ngx_posted_next_events);
+            }
+
+            break;
         }
 
 #if (NGX_HTTP_SSL)
@@ -5439,6 +5468,7 @@ ngx_http_proxy_v2_session_read_handler(ngx_event_t *ev)
 
         sess->received += n;
         b->last += n;
+        read += n;
     }
 
 done:
