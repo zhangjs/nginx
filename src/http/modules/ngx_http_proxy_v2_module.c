@@ -150,6 +150,10 @@ typedef struct {
 
 static ngx_int_t ngx_http_proxy_v2_create_request(ngx_http_request_t *r);
 static ngx_int_t ngx_http_proxy_v2_reinit_request(ngx_http_request_t *r);
+static ngx_int_t ngx_http_proxy_v2_init_connection(ngx_http_request_t *r,
+    ngx_http_upstream_t *u);
+static void ngx_http_proxy_v2_free_connection(ngx_http_request_t *r,
+    ngx_http_upstream_t *u, ngx_int_t rc);
 static ngx_int_t ngx_http_proxy_v2_body_output_filter(void *data,
     ngx_chain_t *in);
 static ngx_int_t ngx_http_proxy_v2_flush_output(ngx_http_request_t *r,
@@ -333,6 +337,8 @@ ngx_http_proxy_v2_handler(ngx_http_request_t *r)
 
     u->create_request = ngx_http_proxy_v2_create_request;
     u->reinit_request = ngx_http_proxy_v2_reinit_request;
+    u->init_connection = ngx_http_proxy_v2_init_connection;
+    u->free_connection = ngx_http_proxy_v2_free_connection;
     u->process_header = ngx_http_proxy_v2_process_header;
     u->abort_request = ngx_http_proxy_v2_abort_request;
     u->finalize_request = ngx_http_proxy_v2_finalize_request;
@@ -1092,10 +1098,6 @@ ngx_http_proxy_v2_reinit_request(ngx_http_request_t *r)
         return NGX_OK;
     }
 
-    if (ctx->stream.session) {
-        ngx_http_proxy_v2_detach_stream(&ctx->stream);
-    }
-
     ctx->stream.header_block = NULL;
     ctx->stream.headers = NULL;
     ctx->stream.last_headers = &ctx->stream.headers;
@@ -1544,6 +1546,18 @@ ngx_http_proxy_v2_process_header(ngx_http_request_t *r)
     ctx = ngx_http_proxy_v2_get_ctx(r);
 
     if (ctx == NULL) {
+
+        if (!r->upstream->request_sent) {
+
+            /*
+             * The upstream can send its connection preface as soon as
+             * the connection is established, before the request is sent
+             * and the stream is set up: the input is processed later.
+             */
+
+            return NGX_AGAIN;
+        }
+
         return NGX_ERROR;
     }
 
@@ -4455,7 +4469,6 @@ static ngx_http_proxy_v2_ctx_t *
 ngx_http_proxy_v2_get_ctx(ngx_http_request_t *r)
 {
     ngx_http_proxy_v2_ctx_t      *ctx;
-    ngx_http_core_loc_conf_t     *clcf;
     ngx_http_proxy_v2_session_t  *sess;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_v2_module);
@@ -4466,34 +4479,74 @@ ngx_http_proxy_v2_get_ctx(ngx_http_request_t *r)
 
     if (ctx->stream.session == NULL) {
 
-        if (ngx_http_proxy_v2_cached(r)) {
-            sess = ngx_pcalloc(r->pool, sizeof(ngx_http_proxy_v2_session_t));
-            if (sess == NULL) {
-                return NULL;
-            }
-
-            sess->connection = r->connection;
-
-            ctx->stream.session = sess;
-            ctx->stream.id = 0;
-
-            return ctx;
+        if (!ngx_http_proxy_v2_cached(r)) {
+            return NULL;
         }
 
-        sess = ngx_http_proxy_v2_get_session(&r->upstream->peer);
+        sess = ngx_pcalloc(r->pool, sizeof(ngx_http_proxy_v2_session_t));
         if (sess == NULL) {
             return NULL;
         }
 
-        if (ngx_http_proxy_v2_attach_stream(sess, &ctx->stream) != NGX_OK) {
-            return NULL;
-        }
+        sess->connection = r->connection;
 
-        clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
-        sess->writer.limit = clcf->sendfile_max_chunk;
+        ctx->stream.session = sess;
+        ctx->stream.id = 0;
     }
 
     return ctx;
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_init_connection(ngx_http_request_t *r, ngx_http_upstream_t *u)
+{
+    ngx_http_proxy_v2_ctx_t      *ctx;
+    ngx_http_core_loc_conf_t     *clcf;
+    ngx_http_proxy_v2_session_t  *sess;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_v2_module);
+
+    if (ctx == NULL) {
+        return NGX_ERROR;
+    }
+
+    sess = ngx_http_proxy_v2_get_session(&u->peer);
+    if (sess == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_proxy_v2_attach_stream(sess, &ctx->stream) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+    sess->writer.limit = clcf->sendfile_max_chunk;
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_proxy_v2_free_connection(ngx_http_request_t *r, ngx_http_upstream_t *u,
+    ngx_int_t rc)
+{
+    ngx_http_proxy_v2_session_t  *sess;
+
+    /* response filters can reset module contexts before finalization */
+
+    sess = ngx_http_proxy_v2_find_session(u->peer.connection);
+    if (sess == NULL) {
+        u->keepalive = 0;
+        return;
+    }
+
+    if (sess->stream == NULL) {
+        /* released already, e.g., before a cache revalidation */
+        return;
+    }
+
+    ngx_http_proxy_v2_detach_stream(sess->stream);
 }
 
 
@@ -4665,28 +4718,7 @@ ngx_http_proxy_v2_abort_request(ngx_http_request_t *r)
 static void
 ngx_http_proxy_v2_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
 {
-    ngx_http_upstream_t          *u;
-    ngx_http_proxy_v2_session_t  *sess;
-
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "finalize proxy http2 request");
-
-    u = r->upstream;
-
-    if (u->peer.connection == NULL) {
-        return;
-    }
-
-    sess = ngx_http_proxy_v2_find_session(u->peer.connection);
-    if (sess == NULL) {
-        u->keepalive = 0;
-        return;
-    }
-
-    if (sess->stream == NULL) {
-        /* released already, e.g., before a cache revalidation */
-        return;
-    }
-
-    ngx_http_proxy_v2_detach_stream(sess->stream);
+    return;
 }
