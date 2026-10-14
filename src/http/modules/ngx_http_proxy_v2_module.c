@@ -46,6 +46,40 @@ typedef enum {
 } ngx_http_proxy_v2_state_e;
 
 
+/*
+ * The outcome of a stream that failed, set once, when the failure happens:
+ *
+ *   refused       not processed by the upstream, retried, not a peer
+ *                 failure: REFUSED_STREAM, GOAWAY with NO_ERROR, no more
+ *                 stream identifiers;
+ *   reset         reset by the upstream: a failure of the request;
+ *
+ * and failures caused by the session, reported to the balancer once
+ * per session:
+ *
+ *   unprocessed   not processed: GOAWAY with an error, or the session
+ *                 failed before the stream was opened; retried;
+ *   frame         a frame of the stream failed the session;
+ *   eof           the session ended before the stream;
+ *   protocol      the session failed on an invalid frame, not of the
+ *                 stream;
+ *   transport     the transport failed.
+ *
+ * A complete response is delivered even if the session fails later.
+ */
+
+typedef enum {
+    NGX_HTTP_PROXY_V2_FAILURE_NONE = 0,
+    NGX_HTTP_PROXY_V2_FAILURE_REFUSED,
+    NGX_HTTP_PROXY_V2_FAILURE_RESET,
+    NGX_HTTP_PROXY_V2_FAILURE_UNPROCESSED,
+    NGX_HTTP_PROXY_V2_FAILURE_FRAME,
+    NGX_HTTP_PROXY_V2_FAILURE_EOF,
+    NGX_HTTP_PROXY_V2_FAILURE_PROTOCOL,
+    NGX_HTTP_PROXY_V2_FAILURE_TRANSPORT
+} ngx_http_proxy_v2_failure_e;
+
+
 typedef struct ngx_http_proxy_v2_stream_s  ngx_http_proxy_v2_stream_t;
 
 
@@ -240,6 +274,7 @@ struct ngx_http_proxy_v2_stream_s {
 
     ngx_uint_t                          id;
     ngx_uint_t                          rst_received_error;
+    ngx_http_proxy_v2_failure_e         failure;
 
     ssize_t                             send_window;
     size_t                              recv_window;
@@ -277,14 +312,7 @@ struct ngx_http_proxy_v2_stream_s {
     unsigned                            end_stream:1;
     unsigned                            done:1;
     unsigned                            headers_parsed:1;
-    unsigned                            rst_parsed:1;
     unsigned                            rst_received:1;
-    unsigned                            unprocessed:1;
-
-    /* not processed, without a failure of the upstream */
-    unsigned                            graceful:1;
-    unsigned                            failed:1;
-    unsigned                            failure_logged:1;
 };
 
 
@@ -410,6 +438,8 @@ static ngx_int_t ngx_http_proxy_v2_non_buffered_filter(void *data,
     ssize_t bytes);
 static ngx_int_t ngx_http_proxy_v2_process_body(ngx_http_request_t *r,
     ngx_http_proxy_v2_ctx_t *ctx);
+static void ngx_http_proxy_v2_log_failure(ngx_http_request_t *r,
+    ngx_http_proxy_v2_stream_t *stream);
 static ngx_int_t ngx_http_proxy_v2_body_filter(ngx_event_pipe_t *p,
     ngx_buf_t *buf);
 static ngx_int_t ngx_http_proxy_v2_parse_data(
@@ -433,6 +463,18 @@ static ngx_int_t ngx_http_proxy_v2_stream_process_window_update(
     ngx_buf_t *b);
 static ngx_int_t ngx_http_proxy_v2_skip_closed_frame(
     ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b, ngx_uint_t new_frame);
+static void ngx_http_proxy_v2_fail_stream(ngx_http_proxy_v2_stream_t *stream,
+    ngx_http_proxy_v2_failure_e failure);
+static ngx_uint_t ngx_http_proxy_v2_failure_retryable(
+    ngx_http_proxy_v2_failure_e failure);
+static ngx_uint_t ngx_http_proxy_v2_failure_from_session(
+    ngx_http_proxy_v2_failure_e failure);
+static ngx_uint_t ngx_http_proxy_v2_failure_invalid(
+    ngx_http_proxy_v2_failure_e failure);
+static ngx_uint_t ngx_http_proxy_v2_stream_closed(
+    ngx_http_proxy_v2_stream_t *stream);
+static void ngx_http_proxy_v2_fail_session(ngx_http_proxy_v2_session_t *sess,
+    ngx_int_t status);
 static ngx_int_t ngx_http_proxy_v2_charge_window(
     ngx_http_proxy_v2_session_t *sess);
 static ngx_int_t ngx_http_proxy_v2_skip_frame(ngx_http_proxy_v2_session_t *sess,
@@ -1419,12 +1461,8 @@ ngx_http_proxy_v2_reinit_request(ngx_http_request_t *r)
     ctx->stream.end_stream = 0;
     ctx->stream.done = 0;
     ctx->stream.headers_parsed = 0;
-    ctx->stream.rst_parsed = 0;
     ctx->stream.rst_received = 0;
-    ctx->stream.unprocessed = 0;
-    ctx->stream.graceful = 0;
-    ctx->stream.failed = 0;
-    ctx->stream.failure_logged = 0;
+    ctx->stream.failure = NGX_HTTP_PROXY_V2_FAILURE_NONE;
     ctx->stream.rst_received_error = 0;
     ctx->stream.data = NULL;
     ctx->stream.data_last = &ctx->stream.data;
@@ -1473,12 +1511,7 @@ ngx_http_proxy_v2_body_output_filter(void *data, ngx_chain_t *in)
         }
     }
 
-    if (sess->read_status == NGX_ERROR
-        || sess->read_status == NGX_HTTP_UPSTREAM_INVALID_HEADER
-        || stream->unprocessed
-        || (stream->rst_received
-            && (stream->rst_received_error || !stream->done)))
-    {
+    if (stream->failure != NGX_HTTP_PROXY_V2_FAILURE_NONE) {
         /* let the read path consume preceding input and report the error */
 
         stream->write.ready = 0;
@@ -1510,7 +1543,7 @@ ngx_http_proxy_v2_body_output_filter(void *data, ngx_chain_t *in)
     }
 
     if (ngx_http_proxy_v2_session_handle_events(sess) != NGX_OK) {
-        sess->connection->error = 1;
+        ngx_http_proxy_v2_fail_session(sess, NGX_ERROR);
         return NGX_ERROR;
     }
 
@@ -1578,7 +1611,7 @@ ngx_http_proxy_v2_session_write(ngx_http_proxy_v2_session_t *sess)
                        "http proxy session write: %p", chain);
 
         if (chain == NGX_CHAIN_ERROR) {
-            c->error = 1;
+            ngx_http_proxy_v2_fail_session(sess, NGX_ERROR);
             return NGX_ERROR;
         }
 
@@ -1690,7 +1723,9 @@ ngx_http_proxy_v2_compose_stream(ngx_http_proxy_v2_session_t *sess,
     ngx_http_proxy_v2_out_t    *out;
     ngx_http_proxy_v2_frame_t  *f;
 
-    if (stream->in == NULL || stream->unprocessed || stream->rst_received) {
+    if (stream->in == NULL || ngx_http_proxy_v2_stream_closed(stream)
+        || stream->failure != NGX_HTTP_PROXY_V2_FAILURE_NONE)
+    {
         return NGX_DECLINED;
     }
 
@@ -1712,10 +1747,8 @@ ngx_http_proxy_v2_compose_stream(ngx_http_proxy_v2_session_t *sess,
         ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
                       "no more http2 stream identifiers");
 
-        /* the request is retried with another connection */
-
-        stream->unprocessed = 1;
-        stream->graceful = 1;
+        ngx_http_proxy_v2_fail_stream(stream,
+                                      NGX_HTTP_PROXY_V2_FAILURE_REFUSED);
         ngx_http_proxy_v2_notify_read(stream);
         return NGX_DECLINED;
     }
@@ -2286,7 +2319,9 @@ ngx_http_proxy_v2_need_read(ngx_http_proxy_v2_session_t *sess)
          stream;
          stream = ngx_http_proxy_v2_next_stream(stream))
     {
-        if (!stream->done && !stream->rst_received) {
+        if (!stream->done
+            && stream->failure == NGX_HTTP_PROXY_V2_FAILURE_NONE)
+        {
             return 1;
         }
     }
@@ -2305,7 +2340,8 @@ ngx_http_proxy_v2_stream_input_consumed(ngx_http_proxy_v2_ctx_t *ctx)
     return stream->data_size == 0
            && ctx->data_used == stream->data_parsed
            && stream->header_block == NULL && stream->headers == NULL
-           && stream->trailers == NULL && !stream->rst_parsed;
+           && stream->trailers == NULL
+           && stream->failure == NGX_HTTP_PROXY_V2_FAILURE_NONE;
 }
 
 
@@ -2398,7 +2434,7 @@ ngx_http_proxy_v2_close_stream(ngx_http_request_t *r,
     }
 
     if (!stream->header_sent
-        || stream->rst_received
+        || ngx_http_proxy_v2_stream_closed(stream)
         || (stream->done && stream->output_closed))
     {
         /* the stream was never opened, or is already closed */
@@ -2557,14 +2593,8 @@ ngx_http_proxy_v2_process_header(ngx_http_request_t *r)
         return rc;
     }
 
-    if (stream->rst_parsed) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "upstream rejected request with error %ui",
-                      stream->rst_received_error);
-        return NGX_HTTP_UPSTREAM_INVALID_HEADER;
-    }
-
-    if (stream->session->read_status == NGX_HTTP_UPSTREAM_INVALID_HEADER) {
+    if (ngx_http_proxy_v2_failure_invalid(stream->failure)) {
+        ngx_http_proxy_v2_log_failure(r, stream);
         return NGX_HTTP_UPSTREAM_INVALID_HEADER;
     }
 
@@ -3202,47 +3232,50 @@ ngx_http_proxy_v2_process_body(ngx_http_request_t *r,
         return NGX_AGAIN;
     }
 
+    /*
+     * A complete response is delivered even if the session failed later,
+     * unless the failure was caused by a frame of the stream.
+     */
+
+    if (stream->failure != NGX_HTTP_PROXY_V2_FAILURE_NONE) {
+        ngx_http_proxy_v2_log_failure(r, stream);
+        return NGX_ERROR;
+    }
+
     if (stream->trailers) {
         if (ngx_http_proxy_v2_process_trailers(r, stream) != NGX_OK) {
             return NGX_ERROR;
         }
     }
 
-    if (stream->rst_parsed) {
-        if (stream->rst_received_error || !stream->done) {
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                          "upstream rejected request with error %ui",
-                          stream->rst_received_error);
-            return NGX_ERROR;
-        }
-
-        stream->rst_parsed = 0;
-    }
-
-    /*
-     * A complete response is delivered even if the session failed later,
-     * unless the failure was caused by a frame of the stream.
-     */
-
-    if (stream->done && !stream->failed) {
-        return NGX_DONE;
-    }
-
-    if (stream->session->read_status == NGX_ERROR
-        || stream->session->read_status == NGX_HTTP_UPSTREAM_INVALID_HEADER)
-    {
-        return NGX_ERROR;
-    }
-
-    if (stream->session->read_status == NGX_DONE && !stream->done) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "upstream prematurely closed connection");
-        return NGX_ERROR;
-    }
-
     /* receive completion still requires input and output to be drained */
 
     return stream->done ? NGX_DONE : NGX_AGAIN;
+}
+
+
+static void
+ngx_http_proxy_v2_log_failure(ngx_http_request_t *r,
+    ngx_http_proxy_v2_stream_t *stream)
+{
+    /* other failures are logged where they are detected */
+
+    switch (stream->failure) {
+
+    case NGX_HTTP_PROXY_V2_FAILURE_RESET:
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "upstream rejected request with error %ui",
+                      stream->rst_received_error);
+        break;
+
+    case NGX_HTTP_PROXY_V2_FAILURE_EOF:
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "upstream prematurely closed connection");
+        break;
+
+    default:
+        break;
+    }
 }
 
 
@@ -3432,7 +3465,9 @@ ngx_http_proxy_v2_replenish_window(ngx_http_proxy_v2_stream_t *stream)
 
     sess = stream->session;
 
-    if (stream->done || stream->rst_received || sess->read_status != NGX_OK) {
+    if (stream->done || stream->failure != NGX_HTTP_PROXY_V2_FAILURE_NONE
+        || sess->read_status != NGX_OK)
+    {
         return NGX_OK;
     }
 
@@ -3610,21 +3645,23 @@ ngx_http_proxy_v2_session_process_frame(ngx_http_proxy_v2_session_t *sess,
 
         rc = ngx_http_proxy_v2_stream_process_frame(stream, b, new_frame);
 
-        if (rc == NGX_ERROR) {
-            /* the error is reported to the stream even if it is complete */
-            stream->failed = 1;
+        if (rc != NGX_ERROR) {
+            return rc;
         }
 
-        if (rc == NGX_ERROR
-            && (sess->type == NGX_HTTP_V2_HEADERS_FRAME
-                || sess->type == NGX_HTTP_V2_CONTINUATION_FRAME))
+        if (sess->type == NGX_HTTP_V2_HEADERS_FRAME
+            || sess->type == NGX_HTTP_V2_CONTINUATION_FRAME)
         {
             ngx_log_error(NGX_LOG_ERR, stream->connection.log, 0,
                           "upstream sent invalid %s",
                           stream->headers_parsed ? "trailer" : "header");
         }
 
-        return rc;
+        /* the error is reported to the stream even if it is complete */
+
+        ngx_http_proxy_v2_fail_stream(stream, NGX_HTTP_PROXY_V2_FAILURE_FRAME);
+
+        return NGX_ERROR;
 
     default:
         /* PRIORITY and unknown frames do not require an attached stream */
@@ -3638,10 +3675,10 @@ static ngx_int_t
 ngx_http_proxy_v2_process_connection_frame(ngx_http_proxy_v2_session_t *sess,
     ngx_buf_t *b)
 {
-    ssize_t                      window_update;
-    ngx_int_t                    rc;
-    ngx_uint_t                   graceful;
-    ngx_http_proxy_v2_stream_t  *stream;
+    ssize_t                       window_update;
+    ngx_int_t                     rc;
+    ngx_http_proxy_v2_stream_t   *stream;
+    ngx_http_proxy_v2_failure_e   failure;
 
     if (sess->type == NGX_HTTP_V2_GOAWAY_FRAME) {
 
@@ -3668,23 +3705,17 @@ ngx_http_proxy_v2_process_connection_frame(ngx_http_proxy_v2_session_t *sess,
 
         sess->goaway = 1;
 
-        /* the first GOAWAY not processing a stream decides its outcome */
-
-        graceful = (sess->goaway_error == NGX_HTTP_PROXY_V2_NO_ERROR);
+        failure = (sess->goaway_error == NGX_HTTP_PROXY_V2_NO_ERROR)
+                  ? NGX_HTTP_PROXY_V2_FAILURE_REFUSED
+                  : NGX_HTTP_PROXY_V2_FAILURE_UNPROCESSED;
 
         for (stream = ngx_http_proxy_v2_first_stream(sess);
              stream;
              stream = ngx_http_proxy_v2_next_stream(stream))
         {
             if (stream->id == 0) {
-
                 /* the stream will not be opened */
-
-                if (!stream->unprocessed) {
-                    stream->unprocessed = 1;
-                    stream->graceful = graceful;
-                }
-
+                ngx_http_proxy_v2_fail_stream(stream, failure);
                 continue;
             }
 
@@ -3702,10 +3733,7 @@ ngx_http_proxy_v2_process_connection_frame(ngx_http_proxy_v2_session_t *sess,
                 return NGX_ERROR;
             }
 
-            if (!stream->unprocessed) {
-                stream->unprocessed = 1;
-                stream->graceful = graceful;
-            }
+            ngx_http_proxy_v2_fail_stream(stream, failure);
         }
 
         return NGX_OK;
@@ -3947,11 +3975,18 @@ ngx_http_proxy_v2_stream_process_frame(ngx_http_proxy_v2_stream_t *stream,
             ngx_log_error(NGX_LOG_ERR, c->log, 0,
                           "upstream refused stream %ui", stream->id);
 
-            stream->unprocessed = 1;
+            ngx_http_proxy_v2_fail_stream(stream,
+                                          NGX_HTTP_PROXY_V2_FAILURE_REFUSED);
             return NGX_OK;
         }
 
-        stream->rst_parsed = 1;
+        /* a reset with NO_ERROR after a complete response is not a failure */
+
+        if (stream->rst_received_error || !stream->done) {
+            ngx_http_proxy_v2_fail_stream(stream,
+                                          NGX_HTTP_PROXY_V2_FAILURE_RESET);
+        }
+
         return NGX_OK;
 
     case NGX_HTTP_V2_DATA_FRAME:
@@ -4051,6 +4086,148 @@ ngx_http_proxy_v2_stream_process_window_update(
     }
 
     return NGX_OK;
+}
+
+
+static void
+ngx_http_proxy_v2_fail_stream(ngx_http_proxy_v2_stream_t *stream,
+    ngx_http_proxy_v2_failure_e failure)
+{
+    /* the first failure is the outcome, later ones are its consequences */
+
+    if (stream->failure == NGX_HTTP_PROXY_V2_FAILURE_NONE) {
+        stream->failure = failure;
+    }
+}
+
+
+static ngx_uint_t
+ngx_http_proxy_v2_failure_retryable(ngx_http_proxy_v2_failure_e failure)
+{
+    /* the request was not processed by the upstream */
+
+    switch (failure) {
+
+    case NGX_HTTP_PROXY_V2_FAILURE_REFUSED:
+    case NGX_HTTP_PROXY_V2_FAILURE_UNPROCESSED:
+        return 1;
+
+    default:
+        return 0;
+    }
+}
+
+
+static ngx_uint_t
+ngx_http_proxy_v2_failure_from_session(ngx_http_proxy_v2_failure_e failure)
+{
+    /* caused by the session: reported to the balancer once per session */
+
+    switch (failure) {
+
+    case NGX_HTTP_PROXY_V2_FAILURE_UNPROCESSED:
+    case NGX_HTTP_PROXY_V2_FAILURE_FRAME:
+    case NGX_HTTP_PROXY_V2_FAILURE_EOF:
+    case NGX_HTTP_PROXY_V2_FAILURE_PROTOCOL:
+    case NGX_HTTP_PROXY_V2_FAILURE_TRANSPORT:
+        return 1;
+
+    default:
+        return 0;
+    }
+}
+
+
+static ngx_uint_t
+ngx_http_proxy_v2_failure_invalid(ngx_http_proxy_v2_failure_e failure)
+{
+    /* an invalid response, as opposed to an error of the transport */
+
+    switch (failure) {
+
+    case NGX_HTTP_PROXY_V2_FAILURE_RESET:
+    case NGX_HTTP_PROXY_V2_FAILURE_FRAME:
+    case NGX_HTTP_PROXY_V2_FAILURE_PROTOCOL:
+        return 1;
+
+    default:
+        return 0;
+    }
+}
+
+
+static ngx_uint_t
+ngx_http_proxy_v2_stream_closed(ngx_http_proxy_v2_stream_t *stream)
+{
+    /* a stream reset by the upstream takes no frames */
+
+    return stream->rst_received;
+}
+
+
+static void
+ngx_http_proxy_v2_fail_session(ngx_http_proxy_v2_session_t *sess,
+    ngx_int_t status)
+{
+    ngx_http_proxy_v2_stream_t   *stream;
+    ngx_http_proxy_v2_failure_e   failure;
+
+    /*
+     * The session stops reading: NGX_DONE is EOF, which can be followed
+     * by an error, NGX_HTTP_UPSTREAM_INVALID_HEADER is a protocol error,
+     * NGX_ERROR is an error of the transport, which is not used anymore.
+     * Each stream not complete yet fails at once.
+     */
+
+    if (status == NGX_ERROR) {
+        sess->connection->error = 1;
+    }
+
+    if ((sess->read_status != NGX_OK && sess->read_status != NGX_DONE)
+        || sess->read_status == status)
+    {
+        return;
+    }
+
+    sess->read_status = status;
+
+    for (stream = ngx_http_proxy_v2_first_stream(sess);
+         stream;
+         stream = ngx_http_proxy_v2_next_stream(stream))
+    {
+        if (stream->failure != NGX_HTTP_PROXY_V2_FAILURE_NONE
+            || stream->done)
+        {
+            continue;
+        }
+
+        if (stream->id == 0) {
+            failure = NGX_HTTP_PROXY_V2_FAILURE_UNPROCESSED;
+
+        } else if (status == NGX_DONE) {
+            failure = NGX_HTTP_PROXY_V2_FAILURE_EOF;
+
+        } else if (status == NGX_HTTP_UPSTREAM_INVALID_HEADER) {
+            failure = NGX_HTTP_PROXY_V2_FAILURE_PROTOCOL;
+
+        } else {
+            failure = NGX_HTTP_PROXY_V2_FAILURE_TRANSPORT;
+        }
+
+        stream->failure = failure;
+
+        /*
+         * The failure of a shared connection is logged with the
+         * connection; each request it fails reports it as well.
+         */
+
+        if (sess->shared && status != NGX_DONE) {
+            ngx_log_error(NGX_LOG_ERR, stream->connection.log, 0,
+                          "upstream http2 connection failed");
+        }
+    }
+
+    ngx_http_proxy_v2_session_notify_read(sess);
 }
 
 
@@ -6067,12 +6244,13 @@ ngx_http_proxy_v2_free_connection(ngx_http_request_t *r, ngx_http_upstream_t *u,
 
     c = sess->connection;
 
-    if (stream->unprocessed) {
+    if (ngx_http_proxy_v2_failure_retryable(stream->failure)) {
         u->unprocessed = 1;
 
         /* a refused stream or a graceful shutdown is not a peer failure */
 
-        u->skip_peer_failure = stream->rst_received || stream->graceful;
+        u->skip_peer_failure =
+                        (stream->failure == NGX_HTTP_PROXY_V2_FAILURE_REFUSED);
     }
 
     if (sess->shared) {
@@ -6157,17 +6335,10 @@ ngx_http_proxy_v2_release_shared(ngx_http_request_t *r,
 
     /*
      * A failure of the session is reported to the balancer once, for the
-     * first stream which failed because of it.  A stream with an outcome
-     * of its own, such as a reset or a graceful shutdown, is not one.
+     * first stream which failed because of it.
      */
 
-    if ((sess->connection->error
-         || sess->read_status != NGX_OK
-         || stream->unprocessed)
-        && !u->skip_peer_failure
-        && !stream->rst_received
-        && (!stream->done || stream->failed))
-    {
+    if (ngx_http_proxy_v2_failure_from_session(stream->failure)) {
         if (sess->failure_reported) {
             u->skip_peer_failure = 1;
 
@@ -6199,7 +6370,7 @@ ngx_http_proxy_v2_release_shared(ngx_http_request_t *r,
 
     } else if (stream->header_sent
                && rc != NGX_DONE
-               && !stream->rst_received
+               && !ngx_http_proxy_v2_stream_closed(stream)
                && !(stream->done && stream->output_closed && rc == NGX_OK)
                && sess->read_status == NGX_OK)
     {
@@ -6357,19 +6528,12 @@ ngx_http_proxy_v2_session_free(ngx_http_proxy_v2_session_t *sess)
 static void
 ngx_http_proxy_v2_session_close(ngx_http_proxy_v2_session_t *sess)
 {
-    ngx_connection_t  *c;
-
     /*
      * The transport is not used anymore, though it is only closed when
      * the last stream is released: requests still refer to it.
      */
 
-    c = sess->connection;
-    c->error = 1;
-
-    if (sess->read_status != NGX_HTTP_UPSTREAM_INVALID_HEADER) {
-        sess->read_status = NGX_ERROR;
-    }
+    ngx_http_proxy_v2_fail_session(sess, NGX_ERROR);
 
     ngx_http_proxy_v2_session_unlist(sess);
 
@@ -6444,7 +6608,7 @@ ngx_http_proxy_v2_init_session(ngx_http_proxy_v2_session_t *sess,
     }
 
     if (ngx_http_proxy_v2_session_handle_events(sess) != NGX_OK) {
-        c->error = 1;
+        ngx_http_proxy_v2_fail_session(sess, NGX_ERROR);
         return NGX_ERROR;
     }
 
@@ -6720,7 +6884,7 @@ ngx_http_proxy_v2_session_read_handler(ngx_event_t *ev)
     }
 
     if (c->error || ev->error) {
-        sess->read_status = NGX_ERROR;
+        ngx_http_proxy_v2_fail_session(sess, NGX_ERROR);
         goto done;
     }
 
@@ -6747,7 +6911,8 @@ ngx_http_proxy_v2_session_read_handler(ngx_event_t *ev)
         }
 
         if (rc != NGX_AGAIN) {
-            sess->read_status = NGX_HTTP_UPSTREAM_INVALID_HEADER;
+            ngx_http_proxy_v2_fail_session(sess,
+                                           NGX_HTTP_UPSTREAM_INVALID_HEADER);
             break;
         }
 
@@ -6757,7 +6922,7 @@ ngx_http_proxy_v2_session_read_handler(ngx_event_t *ev)
         }
 
         if (ngx_http_proxy_v2_reset_buffer(sess) != NGX_OK) {
-            sess->read_status = NGX_ERROR;
+            ngx_http_proxy_v2_fail_session(sess, NGX_ERROR);
             break;
         }
 
@@ -6807,12 +6972,12 @@ ngx_http_proxy_v2_session_read_handler(ngx_event_t *ev)
         }
 
         if (n == NGX_ERROR) {
-            sess->read_status = NGX_ERROR;
+            ngx_http_proxy_v2_fail_session(sess, NGX_ERROR);
             break;
         }
 
         if (n == 0) {
-            sess->read_status = NGX_DONE;
+            ngx_http_proxy_v2_fail_session(sess, NGX_DONE);
 
 #if (NGX_HTTP_SSL)
             if (c->ssl && c->ssl->saved_write_handler) {
@@ -6837,11 +7002,7 @@ ngx_http_proxy_v2_session_read_handler(ngx_event_t *ev)
 done:
 
     if (ngx_http_proxy_v2_session_handle_events(sess) != NGX_OK) {
-        c->error = 1;
-
-        if (sess->read_status != NGX_HTTP_UPSTREAM_INVALID_HEADER) {
-            sess->read_status = NGX_ERROR;
-        }
+        ngx_http_proxy_v2_fail_session(sess, NGX_ERROR);
     }
 
     if (sess->nattached == 0) {
@@ -6886,11 +7047,7 @@ ngx_http_proxy_v2_session_write_handler(ngx_event_t *ev)
     if (rc == NGX_ERROR
         || ngx_http_proxy_v2_session_handle_events(sess) != NGX_OK)
     {
-        c->error = 1;
-
-        if (sess->read_status != NGX_HTTP_UPSTREAM_INVALID_HEADER) {
-            sess->read_status = NGX_ERROR;
-        }
+        ngx_http_proxy_v2_fail_session(sess, NGX_ERROR);
     }
 
     if (sess->read_status == NGX_ERROR
@@ -7011,37 +7168,19 @@ ngx_http_proxy_v2_update_read_event(ngx_http_proxy_v2_stream_t *stream)
         u->response_received = 1;
     }
 
-    if (sess->read_status != NGX_OK && stream->id == 0) {
-        /* the stream was not opened */
-        stream->unprocessed = 1;
-    }
-
     ev->ready = stream->headers || stream->data_size || stream->trailers
-                || stream->rst_parsed || stream->done || stream->unprocessed
+                || stream->done
+                || stream->failure != NGX_HTTP_PROXY_V2_FAILURE_NONE
                 || sess->read_status != NGX_OK;
 
-    /* let queued headers and resets reach process_header() before errors */
-
-    ev->error = (sess->read_status == NGX_ERROR || stream->unprocessed)
-                && (!stream->done || stream->failed)
-                && stream->headers == NULL && !stream->rst_parsed;
-
     /*
-     * The failure of a shared connection is logged with the connection;
-     * each request it fails reports it as well.
+     * Queued headers reach process_header() first; failures reported
+     * there, and EOF, are not read errors.
      */
 
-    if (sess->shared
-        && (sess->read_status == NGX_ERROR
-            || sess->read_status == NGX_HTTP_UPSTREAM_INVALID_HEADER)
-        && !stream->done && !stream->failed && !stream->rst_parsed
-        && !stream->failure_logged)
-    {
-        stream->failure_logged = 1;
-
-        ngx_log_error(NGX_LOG_ERR, stream->connection.log, 0,
-                      "upstream http2 connection failed");
-    }
+    ev->error = (ngx_http_proxy_v2_failure_retryable(stream->failure)
+                 || stream->failure == NGX_HTTP_PROXY_V2_FAILURE_TRANSPORT)
+                && stream->headers == NULL;
 
     /* the transport end is seen by the request after queued input */
 
@@ -7101,9 +7240,7 @@ ngx_http_proxy_v2_recv(ngx_connection_t *c, u_char *buf, size_t size)
 
     if (ngx_http_proxy_v2_replenish_window(stream) != NGX_OK) {
         /* deliver copied bytes before reporting the failure */
-
-        stream->session->read_status = NGX_ERROR;
-        ngx_http_proxy_v2_session_notify_read(stream->session);
+        ngx_http_proxy_v2_fail_session(stream->session, NGX_ERROR);
     }
 
     return n;
@@ -7146,8 +7283,7 @@ ngx_http_proxy_v2_recv_chain(ngx_connection_t *c, ngx_chain_t *in, off_t limit)
     }
 
     if (ngx_http_proxy_v2_replenish_window(stream) != NGX_OK) {
-        stream->session->read_status = NGX_ERROR;
-        ngx_http_proxy_v2_session_notify_read(stream->session);
+        ngx_http_proxy_v2_fail_session(stream->session, NGX_ERROR);
     }
 
     return n;
@@ -7650,7 +7786,6 @@ ngx_http_proxy_v2_detach_stream(ngx_http_proxy_v2_stream_t *stream)
     stream->last_headers = &stream->headers;
     stream->trailers = NULL;
     ngx_http_proxy_v2_release_data(stream);
-    stream->rst_parsed = 0;
     stream->session = NULL;
 }
 
