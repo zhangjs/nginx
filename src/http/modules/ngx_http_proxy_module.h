@@ -73,6 +73,9 @@ typedef struct {
 
     ngx_uint_t                     http_version;
 
+    ngx_flag_t                     http2_multiplex;
+    ngx_uint_t                     http2_max_streams;
+
     ngx_uint_t                     headers_hash_max_size;
     ngx_uint_t                     headers_hash_bucket_size;
 
