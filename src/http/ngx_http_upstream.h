@@ -434,6 +434,10 @@ struct ngx_http_upstream_s {
      * of u->peer.connection; process_header() may return NGX_AGAIN.
      */
     unsigned                         async_header:1;
+
+    /* set by protocol modules for the current attempt */
+    unsigned                         unprocessed:1;
+    unsigned                         skip_peer_failure:1;
 };
 
 
