@@ -427,6 +427,13 @@ struct ngx_http_upstream_s {
     unsigned                         request_body_blocked:1;
     unsigned                         header_sent:1;
     unsigned                         response_received:1;
+
+    /*
+     * The protocol module supplies response header input and notifies
+     * when it is ready, setting receive errors and EOF on the read event
+     * of u->peer.connection; process_header() may return NGX_AGAIN.
+     */
+    unsigned                         async_header:1;
 };
 
 
