@@ -2308,7 +2308,7 @@ ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u,
 
         ngx_add_timer(c->read, u->conf->read_timeout);
 
-        if (c->read->ready) {
+        if (u->async_header || c->read->ready) {
             ngx_http_upstream_process_header(r, u);
             return;
         }
@@ -2566,6 +2566,10 @@ ngx_http_upstream_process_header(ngx_http_request_t *r, ngx_http_upstream_t *u)
         goto done;
     }
 
+    if (u->async_header) {
+        goto again;
+    }
+
     for ( ;; ) {
 
         n = c->recv(c, u->buffer.last, u->buffer.end - u->buffer.last);
@@ -2617,9 +2621,28 @@ ngx_http_upstream_process_header(ngx_http_request_t *r, ngx_http_upstream_t *u)
 
 again:
 
+        if (u->async_header && c->read->error) {
+            ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
+            return;
+        }
+
         rc = u->process_header(r);
 
         if (rc == NGX_AGAIN) {
+
+            if (u->async_header) {
+                if (c->read->eof || c->read->pending_eof) {
+                    ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                                  "upstream prematurely closed connection");
+
+                    ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
+                    return;
+                }
+
+                /* the module will notify us when header input is ready */
+
+                return;
+            }
 
             if (u->buffer.last == u->buffer.end) {
                 ngx_log_error(NGX_LOG_ERR, c->log, 0,
