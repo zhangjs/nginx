@@ -67,6 +67,7 @@ struct ngx_peer_connection_s {
 #endif
 
     unsigned                         cached:1;
+    unsigned                         shared:1;
     unsigned                         transparent:1;
     unsigned                         so_keepalive:1;
     unsigned                         down:1;

@@ -439,6 +439,9 @@ struct ngx_http_upstream_s {
     unsigned                         unprocessed:1;
     unsigned                         skip_peer_failure:1;
     unsigned                         cached_tries:6;
+
+    /* the connection can be shared with other requests */
+    unsigned                         multiplex:1;
 };
 
 
