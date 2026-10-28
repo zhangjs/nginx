@@ -206,6 +206,13 @@ struct ngx_connection_s {
 };
 
 
+static ngx_inline ngx_uint_t
+ngx_connection_shared(ngx_connection_t *c)
+{
+    return c->shared && c->type == SOCK_STREAM;
+}
+
+
 #define ngx_set_connection_log(c, l)                                         \
                                                                              \
     c->log->file = l->file;                                                  \
