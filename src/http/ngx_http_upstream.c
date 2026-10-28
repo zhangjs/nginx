@@ -37,6 +37,8 @@ static void ngx_http_upstream_check_broken_connection(ngx_http_request_t *r,
     ngx_event_t *ev);
 static void ngx_http_upstream_connect(ngx_http_request_t *r,
     ngx_http_upstream_t *u);
+static void ngx_http_upstream_free_connection(ngx_http_request_t *r,
+    ngx_http_upstream_t *u, ngx_int_t rc);
 static ngx_int_t ngx_http_upstream_reinit(ngx_http_request_t *r,
     ngx_http_upstream_t *u);
 static void ngx_http_upstream_send_request(ngx_http_request_t *r,
@@ -2077,6 +2079,22 @@ ngx_http_upstream_ssl_certificate(ngx_http_request_t *r,
 #endif
 
 
+static void
+ngx_http_upstream_free_connection(ngx_http_request_t *r, ngx_http_upstream_t *u,
+    ngx_int_t rc)
+{
+    /*
+     * the protocol releases its request I/O connection and sets back
+     * u->peer.connection to the peer connection, or clears it if it keeps
+     * the peer connection for other requests
+     */
+
+    if (u->peer.connection && u->free_connection) {
+        u->free_connection(r, u, rc);
+    }
+}
+
+
 static ngx_int_t
 ngx_http_upstream_reinit(ngx_http_request_t *r, ngx_http_upstream_t *u)
 {
@@ -2183,6 +2201,22 @@ ngx_http_upstream_send_request(ngx_http_request_t *r, ngx_http_upstream_t *u,
     if (!u->request_sent && ngx_http_upstream_test_connect(c) != NGX_OK) {
         ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
         return;
+    }
+
+    if (!u->request_sent && u->init_connection) {
+
+        /*
+         * the peer connection is established; the protocol may replace
+         * u->peer.connection with its own connection for request I/O
+         * before the request is sent
+         */
+
+        if (u->init_connection(r, u) != NGX_OK) {
+            ngx_http_upstream_next(r, u, NGX_HTTP_UPSTREAM_FT_ERROR);
+            return;
+        }
+
+        c = u->peer.connection;
     }
 
     c->log->action = "sending request to upstream";
@@ -2834,6 +2868,8 @@ ngx_http_upstream_test_next(ngx_http_request_t *r, ngx_http_upstream_t *u)
         {
             ngx_int_t  rc;
 
+            ngx_http_upstream_free_connection(r, u, NGX_ERROR);
+
             rc = u->reinit_request(r);
 
             if (rc != NGX_OK) {
@@ -2878,6 +2914,8 @@ ngx_http_upstream_test_next(ngx_http_request_t *r, ngx_http_upstream_t *u)
         valid = r->cache->valid_sec;
         updating = r->cache->updating_sec;
         error = r->cache->error_sec;
+
+        ngx_http_upstream_free_connection(r, u, 0);
 
         rc = u->reinit_request(r);
 
@@ -4612,21 +4650,22 @@ ngx_http_upstream_next(ngx_http_request_t *r, ngx_http_upstream_t *u,
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "http next upstream, %xi", ft_type);
 
+    if (u->peer.sockaddr && u->peer.connection) {
+        u->state->bytes_sent = u->peer.connection->sent;
+    }
+
+    if (ft_type == NGX_HTTP_UPSTREAM_FT_HTTP_403
+        || ft_type == NGX_HTTP_UPSTREAM_FT_HTTP_404)
+    {
+        state = NGX_PEER_NEXT;
+
+    } else {
+        state = NGX_PEER_FAILED;
+    }
+
+    ngx_http_upstream_free_connection(r, u, NGX_ERROR);
+
     if (u->peer.sockaddr) {
-
-        if (u->peer.connection) {
-            u->state->bytes_sent = u->peer.connection->sent;
-        }
-
-        if (ft_type == NGX_HTTP_UPSTREAM_FT_HTTP_403
-            || ft_type == NGX_HTTP_UPSTREAM_FT_HTTP_404)
-        {
-            state = NGX_PEER_NEXT;
-
-        } else {
-            state = NGX_PEER_FAILED;
-        }
-
         u->peer.free(&u->peer, u->peer.data, state);
         u->peer.sockaddr = NULL;
 
@@ -4816,6 +4855,8 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
     }
 
     u->finalize_request(r, rc);
+
+    ngx_http_upstream_free_connection(r, u, rc);
 
     if (u->peer.free && u->peer.sockaddr) {
         u->peer.free(&u->peer, u->peer.data, 0);
