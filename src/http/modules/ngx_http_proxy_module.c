@@ -4068,6 +4068,12 @@ ngx_http_proxy_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_uint_value(conf->http_version, prev->http_version,
                               NGX_HTTP_VERSION_11);
 
+#if (NGX_HTTP_V2)
+    if (conf->http_version == NGX_HTTP_VERSION_20) {
+        conf->upstream.preserve_output = 1;
+    }
+#endif
+
     ngx_conf_merge_uint_value(conf->headers_hash_max_size,
                               prev->headers_hash_max_size, 512);
 
