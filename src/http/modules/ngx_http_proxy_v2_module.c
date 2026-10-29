@@ -22,8 +22,14 @@
 #define NGX_HTTP_PROXY_V2_MAX_STREAM_ID     0x7fffffff
 
 #define NGX_HTTP_PROXY_V2_NO_ERROR          0x0
+#define NGX_HTTP_PROXY_V2_PROTOCOL_ERROR    0x1
+#define NGX_HTTP_PROXY_V2_FLOW_CTRL_ERROR   0x3
+#define NGX_HTTP_PROXY_V2_STREAM_CLOSED     0x5
 #define NGX_HTTP_PROXY_V2_REFUSED_STREAM    0x7
 #define NGX_HTTP_PROXY_V2_CANCEL            0x8
+
+/* an error confined to a stream (RFC 9113, Section 5.4.2) */
+#define NGX_HTTP_PROXY_V2_STREAM_ERROR      -10
 
 
 typedef enum {
@@ -48,6 +54,7 @@ typedef enum {
  *                 failure: REFUSED_STREAM, GOAWAY with NO_ERROR, no more
  *                 stream identifiers;
  *   reset         reset by the upstream: a failure of the request;
+ *   stream        reset on a stream error: an invalid response;
  *
  * and failures caused by the session, reported to the balancer once
  * per session:
@@ -67,6 +74,7 @@ typedef enum {
     NGX_HTTP_PROXY_V2_FAILURE_NONE = 0,
     NGX_HTTP_PROXY_V2_FAILURE_REFUSED,
     NGX_HTTP_PROXY_V2_FAILURE_RESET,
+    NGX_HTTP_PROXY_V2_FAILURE_STREAM,
     NGX_HTTP_PROXY_V2_FAILURE_UNPROCESSED,
     NGX_HTTP_PROXY_V2_FAILURE_FRAME,
     NGX_HTTP_PROXY_V2_FAILURE_EOF,
@@ -256,6 +264,7 @@ struct ngx_http_proxy_v2_stream_s {
 
     ngx_uint_t                          id;
     ngx_uint_t                          rst_received_error;
+    ngx_uint_t                          rst_sent_error;
     ngx_http_proxy_v2_failure_e         failure;
 
     ssize_t                             send_window;
@@ -291,6 +300,7 @@ struct ngx_http_proxy_v2_stream_s {
     unsigned                            done:1;
     unsigned                            headers_parsed:1;
     unsigned                            rst_received:1;
+    unsigned                            rst_sent:1;
 
     /* input, an error or EOF is ready for the request */
     unsigned                            readable:1;
@@ -454,6 +464,8 @@ static ngx_int_t ngx_http_proxy_v2_stream_process_window_update(
     ngx_buf_t *b);
 static ngx_int_t ngx_http_proxy_v2_skip_closed_frame(
     ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b, ngx_uint_t new_frame);
+static ngx_int_t ngx_http_proxy_v2_stream_error(
+    ngx_http_proxy_v2_stream_t *stream, ngx_uint_t code);
 static void ngx_http_proxy_v2_fail_stream(ngx_http_proxy_v2_stream_t *stream,
     ngx_http_proxy_v2_failure_e failure);
 static ngx_uint_t ngx_http_proxy_v2_failure_retryable(
@@ -464,6 +476,9 @@ static ngx_uint_t ngx_http_proxy_v2_stream_closed(
     ngx_http_proxy_v2_stream_t *stream);
 static void ngx_http_proxy_v2_fail_session(ngx_http_proxy_v2_session_t *sess,
     ngx_int_t status);
+static ngx_int_t ngx_http_proxy_v2_reset_stream(
+    ngx_http_proxy_v2_session_t *sess, ngx_http_proxy_v2_stream_t *stream,
+    ngx_buf_t *b, ngx_uint_t new_frame);
 static ngx_int_t ngx_http_proxy_v2_charge_window(
     ngx_http_proxy_v2_session_t *sess);
 static ngx_int_t ngx_http_proxy_v2_skip_frame(ngx_http_proxy_v2_session_t *sess,
@@ -1419,8 +1434,10 @@ ngx_http_proxy_v2_reinit_request(ngx_http_request_t *r)
     ctx->stream.done = 0;
     ctx->stream.headers_parsed = 0;
     ctx->stream.rst_received = 0;
+    ctx->stream.rst_sent = 0;
     ctx->stream.failure = NGX_HTTP_PROXY_V2_FAILURE_NONE;
     ctx->stream.rst_received_error = 0;
+    ctx->stream.rst_sent_error = 0;
     ctx->stream.data = NULL;
     ctx->stream.data_last = &ctx->stream.data;
     ctx->stream.data_size = 0;
@@ -2180,6 +2197,11 @@ ngx_http_proxy_v2_close_stream(ngx_http_request_t *r,
     sess = stream->session;
     c = sess->connection;
 
+    if (stream->failure == NGX_HTTP_PROXY_V2_FAILURE_STREAM) {
+        /* as with HTTP/1, a connection with an invalid response is not kept */
+        return 0;
+    }
+
     /*
      * A stream released before it is closed, e.g., on a client abort or
      * a header-only response, is reset with CANCEL.  The connection is
@@ -2575,7 +2597,8 @@ ngx_http_proxy_v2_parse_headers(ngx_http_proxy_v2_stream_t *stream,
         {
             ngx_log_error(NGX_LOG_ERR, c->log, 0,
                           "upstream sent too large http2 header block");
-            return NGX_ERROR;
+            return ngx_http_proxy_v2_stream_error(stream,
+                                                  NGX_HTTP_PROXY_V2_CANCEL);
         }
 
         block->length += size;
@@ -2591,8 +2614,8 @@ ngx_http_proxy_v2_parse_headers(ngx_http_proxy_v2_stream_t *stream,
                    ? NGX_OK : NGX_AGAIN;
         }
 
-        if (rc == NGX_ERROR) {
-            return NGX_ERROR;
+        if (rc == NGX_ERROR || rc == NGX_HTTP_PROXY_V2_STREAM_ERROR) {
+            return rc;
         }
 
         if (rc == NGX_HTTP_PARSE_HEADER_DONE) {
@@ -2603,7 +2626,8 @@ ngx_http_proxy_v2_parse_headers(ngx_http_proxy_v2_stream_t *stream,
                     ngx_log_error(NGX_LOG_ERR, c->log, 0,
                                   "upstream sent trailer without "
                                   "end stream flag");
-                    return NGX_ERROR;
+                    return ngx_http_proxy_v2_stream_error(stream,
+                                              NGX_HTTP_PROXY_V2_PROTOCOL_ERROR);
                 }
 
                 stream->trailers = block;
@@ -2612,7 +2636,8 @@ ngx_http_proxy_v2_parse_headers(ngx_http_proxy_v2_stream_t *stream,
                 if (block->status == 0) {
                     ngx_log_error(NGX_LOG_ERR, c->log, 0,
                                   "upstream sent no :status header");
-                    return NGX_ERROR;
+                    return ngx_http_proxy_v2_stream_error(stream,
+                                              NGX_HTTP_PROXY_V2_PROTOCOL_ERROR);
                 }
 
                 if (block->status == NGX_HTTP_EARLY_HINTS
@@ -2620,7 +2645,8 @@ ngx_http_proxy_v2_parse_headers(ngx_http_proxy_v2_stream_t *stream,
                 {
                     ngx_log_error(NGX_LOG_ERR, c->log, 0,
                                   "upstream prematurely closed stream");
-                    return NGX_ERROR;
+                    return ngx_http_proxy_v2_stream_error(stream,
+                                              NGX_HTTP_PROXY_V2_PROTOCOL_ERROR);
                 }
 
                 *stream->last_headers = block;
@@ -2660,13 +2686,15 @@ ngx_http_proxy_v2_parse_headers(ngx_http_proxy_v2_stream_t *stream,
                 ngx_log_error(NGX_LOG_ERR, c->log, 0,
                               "upstream sent invalid header \"%V: %V\"",
                               &stream->name, &stream->value);
-                return NGX_ERROR;
+                return ngx_http_proxy_v2_stream_error(stream,
+                                              NGX_HTTP_PROXY_V2_PROTOCOL_ERROR);
             }
 
             if (block->status) {
                 ngx_log_error(NGX_LOG_ERR, c->log, 0,
                               "upstream sent duplicate :status header");
-                return NGX_ERROR;
+                return ngx_http_proxy_v2_stream_error(stream,
+                                              NGX_HTTP_PROXY_V2_PROTOCOL_ERROR);
             }
 
             status = stream->value.len == 3
@@ -2676,14 +2704,16 @@ ngx_http_proxy_v2_parse_headers(ngx_http_proxy_v2_stream_t *stream,
                 ngx_log_error(NGX_LOG_ERR, c->log, 0,
                               "upstream sent invalid :status \"%V\"",
                               &stream->value);
-                return NGX_ERROR;
+                return ngx_http_proxy_v2_stream_error(stream,
+                                              NGX_HTTP_PROXY_V2_PROTOCOL_ERROR);
             }
 
             if (status < NGX_HTTP_OK && status != NGX_HTTP_EARLY_HINTS) {
                 ngx_log_error(NGX_LOG_ERR, c->log, 0,
                               "upstream sent unexpected :status \"%V\"",
                               &stream->value);
-                return NGX_ERROR;
+                return ngx_http_proxy_v2_stream_error(stream,
+                                              NGX_HTTP_PROXY_V2_PROTOCOL_ERROR);
             }
 
             block->status = status;
@@ -2693,7 +2723,8 @@ ngx_http_proxy_v2_parse_headers(ngx_http_proxy_v2_stream_t *stream,
         if (!stream->headers_parsed && block->status == 0) {
             ngx_log_error(NGX_LOG_ERR, c->log, 0,
                           "upstream sent no :status header");
-            return NGX_ERROR;
+            return ngx_http_proxy_v2_stream_error(stream,
+                                              NGX_HTTP_PROXY_V2_PROTOCOL_ERROR);
         }
 
         h = ngx_list_push(&block->fields);
@@ -3322,13 +3353,13 @@ ngx_http_proxy_v2_session_process_frame(ngx_http_proxy_v2_session_t *sess,
 
         stream = ngx_http_proxy_v2_find_stream(sess, sess->stream_id);
 
-        if (stream == NULL) {
+        if (stream == NULL || stream->rst_sent) {
             return ngx_http_proxy_v2_skip_closed_frame(sess, b, new_frame);
         }
 
         rc = ngx_http_proxy_v2_stream_process_frame(stream, b, new_frame);
 
-        if (rc != NGX_ERROR) {
+        if (rc != NGX_ERROR && rc != NGX_HTTP_PROXY_V2_STREAM_ERROR) {
             return rc;
         }
 
@@ -3338,6 +3369,10 @@ ngx_http_proxy_v2_session_process_frame(ngx_http_proxy_v2_session_t *sess,
             ngx_log_error(NGX_LOG_ERR, stream->connection.log, 0,
                           "upstream sent invalid %s",
                           stream->headers_parsed ? "trailer" : "header");
+        }
+
+        if (rc == NGX_HTTP_PROXY_V2_STREAM_ERROR) {
+            return ngx_http_proxy_v2_reset_stream(sess, stream, b, new_frame);
         }
 
         /* the error is reported to the stream even if it is complete */
@@ -3593,7 +3628,8 @@ ngx_http_proxy_v2_stream_process_frame(ngx_http_proxy_v2_stream_t *stream,
             ngx_log_error(NGX_LOG_ERR, c->log, 0,
                           "upstream sent frame for closed stream %ui",
                           sess->stream_id);
-            return NGX_ERROR;
+            return ngx_http_proxy_v2_stream_error(stream,
+                                               NGX_HTTP_PROXY_V2_STREAM_CLOSED);
         }
 
         if (sess->type == NGX_HTTP_V2_DATA_FRAME) {
@@ -3601,7 +3637,8 @@ ngx_http_proxy_v2_stream_process_frame(ngx_http_proxy_v2_stream_t *stream,
                 ngx_log_error(NGX_LOG_ERR, c->log, 0,
                               "upstream sent unexpected http2 frame: %d",
                               sess->type);
-                return NGX_ERROR;
+                return ngx_http_proxy_v2_stream_error(stream,
+                                              NGX_HTTP_PROXY_V2_PROTOCOL_ERROR);
             }
 
             if (sess->rest > stream->recv_window) {
@@ -3609,7 +3646,8 @@ ngx_http_proxy_v2_stream_process_frame(ngx_http_proxy_v2_stream_t *stream,
                               "upstream violated stream flow control, "
                               "received %uz data frame with window %uz",
                               sess->rest, stream->recv_window);
-                return NGX_ERROR;
+                return ngx_http_proxy_v2_stream_error(stream,
+                                             NGX_HTTP_PROXY_V2_FLOW_CTRL_ERROR);
             }
 
             /* charge the full payload once, including padding */
@@ -3739,17 +3777,19 @@ ngx_http_proxy_v2_stream_process_window_update(
     }
 
     if (sess->window_update == 0) {
-        ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+        ngx_log_error(NGX_LOG_ERR, stream->connection.log, 0,
                       "upstream sent zero window update");
-        return NGX_ERROR;
+        return ngx_http_proxy_v2_stream_error(stream,
+                                              NGX_HTTP_PROXY_V2_PROTOCOL_ERROR);
     }
 
     if (stream->send_window > (ssize_t) NGX_HTTP_V2_MAX_WINDOW
                               - (ssize_t) sess->window_update)
     {
-        ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+        ngx_log_error(NGX_LOG_ERR, stream->connection.log, 0,
                       "upstream sent too large window update");
-        return NGX_ERROR;
+        return ngx_http_proxy_v2_stream_error(stream,
+                                             NGX_HTTP_PROXY_V2_FLOW_CTRL_ERROR);
     }
 
     stream->send_window += (ssize_t) sess->window_update;
@@ -3799,6 +3839,7 @@ ngx_http_proxy_v2_failure_invalid(ngx_http_proxy_v2_failure_e failure)
     switch (failure) {
 
     case NGX_HTTP_PROXY_V2_FAILURE_RESET:
+    case NGX_HTTP_PROXY_V2_FAILURE_STREAM:
     case NGX_HTTP_PROXY_V2_FAILURE_FRAME:
     case NGX_HTTP_PROXY_V2_FAILURE_PROTOCOL:
         return 1;
@@ -3812,9 +3853,9 @@ ngx_http_proxy_v2_failure_invalid(ngx_http_proxy_v2_failure_e failure)
 static ngx_uint_t
 ngx_http_proxy_v2_stream_closed(ngx_http_proxy_v2_stream_t *stream)
 {
-    /* a stream reset by the upstream takes no frames */
+    /* a stream reset by either side takes no frames */
 
-    return stream->rst_received;
+    return stream->rst_received || stream->rst_sent;
 }
 
 
@@ -3871,6 +3912,76 @@ ngx_http_proxy_v2_fail_session(ngx_http_proxy_v2_session_t *sess,
     }
 
     ngx_http_proxy_v2_session_notify_read(sess);
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_stream_error(ngx_http_proxy_v2_stream_t *stream,
+    ngx_uint_t code)
+{
+    stream->rst_sent_error = code;
+
+    return NGX_HTTP_PROXY_V2_STREAM_ERROR;
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_reset_stream(ngx_http_proxy_v2_session_t *sess,
+    ngx_http_proxy_v2_stream_t *stream, ngx_buf_t *b, ngx_uint_t new_frame)
+{
+    /*
+     * A stream error resets the stream alone: the session goes on, and
+     * the rest of the frame, as well as frames received for the stream
+     * after the reset is sent, are ignored as for a closed stream.  Header
+     * blocks need not be decoded, as the header table size is zero.
+     */
+
+    if (sess->cached) {
+        return NGX_ERROR;
+    }
+
+    ngx_http_proxy_v2_fail_stream(stream, NGX_HTTP_PROXY_V2_FAILURE_STREAM);
+    stream->in = NULL;
+
+    if (sess->type == NGX_HTTP_V2_RST_STREAM_FRAME) {
+        /* a reset is not answered with a reset (RFC 9113, Section 5.4.2) */
+
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, sess->connection->log, 0,
+                       "http proxy stream %ui reset not answered",
+                       stream->id);
+
+    } else {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, sess->connection->log, 0,
+                       "http proxy reset stream %ui with error %ui",
+                       stream->id, stream->rst_sent_error);
+
+        if (ngx_http_proxy_v2_send_rst_stream(sess, stream->id,
+                                              stream->rst_sent_error)
+            != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+
+        stream->rst_sent = 1;
+
+        ngx_post_event(sess->connection->write, &ngx_posted_events);
+    }
+
+    ngx_http_proxy_v2_notify_read(stream);
+
+    if ((sess->type == NGX_HTTP_V2_HEADERS_FRAME
+         || sess->type == NGX_HTTP_V2_CONTINUATION_FRAME)
+        && (sess->flags & NGX_HTTP_V2_END_HEADERS_FLAG))
+    {
+        sess->continuation_sid = 0;
+    }
+
+    if (sess->state < ngx_http_proxy_v2_st_payload) {
+        /* the frame was processed in full */
+        return NGX_OK;
+    }
+
+    return ngx_http_proxy_v2_skip_closed_frame(sess, b, new_frame);
 }
 
 
@@ -4362,8 +4473,8 @@ ngx_http_proxy_v2_parse_header(ngx_http_proxy_v2_stream_t *stream,
             return NGX_AGAIN;
         }
 
-        if (rc == NGX_ERROR) {
-            return NGX_ERROR;
+        if (rc == NGX_ERROR || rc == NGX_HTTP_PROXY_V2_STREAM_ERROR) {
+            return rc;
         }
 
         if (rc == NGX_OK) {
@@ -4770,7 +4881,8 @@ ngx_http_proxy_v2_parse_fragment(ngx_http_proxy_v2_stream_t *stream,
                               "upstream sent too large http2 "
                               "header name length: %uz",
                               stream->name.len);
-                return NGX_ERROR;
+                return ngx_http_proxy_v2_stream_error(stream,
+                                                      NGX_HTTP_PROXY_V2_CANCEL);
             }
 
             stream->name.data = ngx_pnalloc(c->pool, stream->name.len + 1);
@@ -4888,7 +5000,8 @@ ngx_http_proxy_v2_parse_fragment(ngx_http_proxy_v2_stream_t *stream,
                               "upstream sent too large http2 "
                               "header value length: %uz",
                               stream->value.len);
-                return NGX_ERROR;
+                return ngx_http_proxy_v2_stream_error(stream,
+                                                      NGX_HTTP_PROXY_V2_CANCEL);
             }
 
             stream->value.data = ngx_pnalloc(c->pool, stream->value.len + 1);
@@ -4969,7 +5082,8 @@ ngx_http_proxy_v2_parse_fragment(ngx_http_proxy_v2_stream_t *stream,
                 ngx_log_error(NGX_LOG_ERR, c->log, 0,
                               "upstream sent invalid header: \"%V: %V\"",
                               &stream->name, &stream->value);
-                return NGX_ERROR;
+                return ngx_http_proxy_v2_stream_error(stream,
+                                              NGX_HTTP_PROXY_V2_PROTOCOL_ERROR);
             }
         }
 
@@ -4980,7 +5094,8 @@ ngx_http_proxy_v2_parse_fragment(ngx_http_proxy_v2_stream_t *stream,
                 ngx_log_error(NGX_LOG_ERR, c->log, 0,
                               "upstream sent invalid header: \"%V: %V\"",
                               &stream->name, &stream->value);
-                return NGX_ERROR;
+                return ngx_http_proxy_v2_stream_error(stream,
+                                              NGX_HTTP_PROXY_V2_PROTOCOL_ERROR);
             }
         }
 
@@ -4989,7 +5104,8 @@ ngx_http_proxy_v2_parse_fragment(ngx_http_proxy_v2_stream_t *stream,
         if (len > stream->header_limit) {
             ngx_log_error(NGX_LOG_ERR, c->log, 0,
                           "upstream sent too large http2 header");
-            return NGX_ERROR;
+            return ngx_http_proxy_v2_stream_error(stream,
+                                                  NGX_HTTP_PROXY_V2_CANCEL);
         }
 
         stream->header_limit -= len;
