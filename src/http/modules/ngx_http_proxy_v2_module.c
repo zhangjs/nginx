@@ -22,6 +22,7 @@
 #define NGX_HTTP_PROXY_V2_MAX_STREAM_ID     0x7fffffff
 
 #define NGX_HTTP_PROXY_V2_NO_ERROR          0x0
+#define NGX_HTTP_PROXY_V2_CANCEL            0x8
 
 
 typedef enum {
@@ -404,6 +405,8 @@ static ngx_uint_t ngx_http_proxy_v2_stream_output_done(
 static ngx_uint_t ngx_http_proxy_v2_session_can_keepalive(
     ngx_http_proxy_v2_session_t *sess);
 static ngx_uint_t ngx_http_proxy_v2_can_keepalive(ngx_http_proxy_v2_ctx_t *ctx);
+static ngx_uint_t ngx_http_proxy_v2_close_stream(ngx_http_request_t *r,
+    ngx_http_proxy_v2_stream_t *stream);
 static ngx_int_t ngx_http_proxy_v2_finish_body(ngx_http_request_t *r,
     ngx_http_proxy_v2_ctx_t *ctx);
 static ngx_int_t ngx_http_proxy_v2_process_header(ngx_http_request_t *r);
@@ -444,6 +447,8 @@ static ngx_int_t ngx_http_proxy_v2_stream_process_frame(
 static ngx_int_t ngx_http_proxy_v2_stream_process_window_update(
     ngx_http_proxy_v2_session_t *sess, ngx_http_proxy_v2_stream_t *stream,
     ngx_buf_t *b);
+static ngx_int_t ngx_http_proxy_v2_skip_closed_frame(
+    ngx_http_proxy_v2_session_t *sess, ngx_buf_t *b, ngx_uint_t new_frame);
 static void ngx_http_proxy_v2_fail_stream(ngx_http_proxy_v2_stream_t *stream,
     ngx_http_proxy_v2_failure_e failure);
 static ngx_uint_t ngx_http_proxy_v2_failure_invalid(
@@ -484,6 +489,8 @@ static ngx_int_t ngx_http_proxy_v2_send_ping_ack(
     ngx_http_proxy_v2_session_t *sess);
 static ngx_int_t ngx_http_proxy_v2_send_window_update(
     ngx_http_proxy_v2_session_t *sess, ngx_uint_t id, size_t n);
+static ngx_int_t ngx_http_proxy_v2_send_rst_stream(
+    ngx_http_proxy_v2_session_t *sess, ngx_uint_t id, ngx_uint_t error);
 
 static ngx_chain_t *ngx_http_proxy_v2_get_buf(
     ngx_http_proxy_v2_stream_t *stream);
@@ -2156,6 +2163,54 @@ ngx_http_proxy_v2_can_keepalive(ngx_http_proxy_v2_ctx_t *ctx)
 }
 
 
+static ngx_uint_t
+ngx_http_proxy_v2_close_stream(ngx_http_request_t *r,
+    ngx_http_proxy_v2_stream_t *stream)
+{
+    ngx_connection_t             *c;
+    ngx_http_proxy_v2_session_t  *sess;
+
+    sess = stream->session;
+    c = sess->connection;
+
+    /*
+     * A stream released before it is closed, e.g., on a client abort or
+     * a header-only response, is reset with CANCEL.  The connection is
+     * only kept if this completes synchronously: with no frame partially
+     * written and the reset written at once.
+     */
+
+    if (!ngx_http_proxy_v2_session_can_keepalive(sess)
+        || c->read->timedout || c->write->timedout)
+    {
+        return 0;
+    }
+
+    if (!stream->header_sent
+        || ngx_http_proxy_v2_stream_closed(stream)
+        || (stream->done && stream->output_closed))
+    {
+        /* the stream was never opened, or is already closed */
+        return 1;
+    }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "http proxy cancel stream %ui", stream->id);
+
+    stream->in = NULL;
+
+    if (ngx_http_proxy_v2_send_rst_stream(sess, stream->id,
+                                          NGX_HTTP_PROXY_V2_CANCEL)
+        != NGX_OK)
+    {
+        return 0;
+    }
+
+    return ngx_http_proxy_v2_session_write(sess) == NGX_OK
+           && !ngx_http_proxy_v2_output_pending(sess);
+}
+
+
 static ngx_int_t
 ngx_http_proxy_v2_finish_body(ngx_http_request_t *r,
     ngx_http_proxy_v2_ctx_t *ctx)
@@ -2229,7 +2284,8 @@ ngx_http_proxy_v2_finish_body(ngx_http_request_t *r,
          * sent: as with other upstream protocols, stop sending it instead
          * of waiting for the upstream to accept it, which it may never do.
          * Unless the upstream reset the stream with NO_ERROR, the stream
-         * remains open on our side, and the connection is not kept.
+         * remains open on our side, and is cancelled when released, see
+         * ngx_http_proxy_v2_close_stream().
          */
 
         stream->in = NULL;
@@ -3260,10 +3316,7 @@ ngx_http_proxy_v2_session_process_frame(ngx_http_proxy_v2_session_t *sess,
         stream = ngx_http_proxy_v2_find_stream(sess, sess->stream_id);
 
         if (stream == NULL) {
-            ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
-                          "upstream sent frame for unknown stream %ui",
-                          sess->stream_id);
-            return NGX_ERROR;
+            return ngx_http_proxy_v2_skip_closed_frame(sess, b, new_frame);
         }
 
         rc = ngx_http_proxy_v2_stream_process_frame(stream, b, new_frame);
@@ -3778,6 +3831,52 @@ ngx_http_proxy_v2_fail_session(ngx_http_proxy_v2_session_t *sess,
     }
 
     ngx_http_proxy_v2_session_notify_read(sess);
+}
+
+
+static ngx_int_t
+ngx_http_proxy_v2_skip_closed_frame(ngx_http_proxy_v2_session_t *sess,
+    ngx_buf_t *b, ngx_uint_t new_frame)
+{
+    if (sess->stream_id % 2 == 0 || sess->stream_id > sess->last_stream_id) {
+        ngx_log_error(NGX_LOG_ERR, sess->connection->log, 0,
+                      "upstream sent frame for unknown stream %ui",
+                      sess->stream_id);
+        return NGX_ERROR;
+    }
+
+    /*
+     * Frames for a stream already closed on our side, such as a cancelled
+     * one, are ignored (RFC 9113, Section 5.1).  Header blocks need not be
+     * decoded, as the header table size is zero, while DATA payload still
+     * counts against the connection window.
+     */
+
+    if (new_frame) {
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, sess->connection->log, 0,
+                       "http proxy frame %d for closed stream %ui",
+                       sess->type, sess->stream_id);
+
+        if (sess->type == NGX_HTTP_V2_DATA_FRAME
+            && ngx_http_proxy_v2_charge_window(sess) != NGX_OK)
+        {
+            return NGX_ERROR;
+        }
+    }
+
+    /*
+     * The skipped header block ends with the frame, which can be partially
+     * received already, e.g., for a stream released while receiving it.
+     */
+
+    if ((sess->type == NGX_HTTP_V2_HEADERS_FRAME
+         || sess->type == NGX_HTTP_V2_CONTINUATION_FRAME)
+        && (sess->flags & NGX_HTTP_V2_END_HEADERS_FLAG))
+    {
+        sess->continuation_sid = 0;
+    }
+
+    return ngx_http_proxy_v2_skip_frame(sess, b);
 }
 
 
@@ -5443,6 +5542,47 @@ ngx_http_proxy_v2_send_window_update(ngx_http_proxy_v2_session_t *sess,
 }
 
 
+static ngx_int_t
+ngx_http_proxy_v2_send_rst_stream(ngx_http_proxy_v2_session_t *sess,
+    ngx_uint_t id, ngx_uint_t error)
+{
+    ngx_chain_t                *cl;
+    ngx_http_proxy_v2_frame_t  *f;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, sess->connection->log, 0,
+                   "http proxy send rst stream: stream %ui, error %ui",
+                   id, error);
+
+    cl = ngx_http_proxy_v2_get_control_buf(sess);
+    if (cl == NULL) {
+        return NGX_ERROR;
+    }
+
+    f = (ngx_http_proxy_v2_frame_t *) cl->buf->last;
+    cl->buf->last += sizeof(ngx_http_proxy_v2_frame_t);
+
+    f->length_0 = 0;
+    f->length_1 = 0;
+    f->length_2 = 4;
+    f->type = NGX_HTTP_V2_RST_STREAM_FRAME;
+    f->flags = 0;
+    f->stream_id_0 = (u_char) ((id >> 24) & 0xff);
+    f->stream_id_1 = (u_char) ((id >> 16) & 0xff);
+    f->stream_id_2 = (u_char) ((id >> 8) & 0xff);
+    f->stream_id_3 = (u_char) (id & 0xff);
+
+    *cl->buf->last++ = (u_char) ((error >> 24) & 0xff);
+    *cl->buf->last++ = (u_char) ((error >> 16) & 0xff);
+    *cl->buf->last++ = (u_char) ((error >> 8) & 0xff);
+    *cl->buf->last++ = (u_char) (error & 0xff);
+
+    *sess->last_out = cl;
+    sess->last_out = &cl->next;
+
+    return NGX_OK;
+}
+
+
 static ngx_chain_t *
 ngx_http_proxy_v2_get_buf(ngx_http_proxy_v2_stream_t *stream)
 {
@@ -5715,6 +5855,10 @@ ngx_http_proxy_v2_free_connection(ngx_http_request_t *r, ngx_http_upstream_t *u,
 
     u->keepalive = (rc == 0 || rc == NGX_AGAIN)
                    && ngx_http_proxy_v2_can_keepalive(ctx);
+
+    if (!u->keepalive) {
+        u->keepalive = ngx_http_proxy_v2_close_stream(r, stream);
+    }
 
     /*
      * The stream is closed: the connection can be kept alive, though the
