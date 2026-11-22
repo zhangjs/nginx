@@ -18,6 +18,10 @@ typedef struct ngx_event_pipe_s  ngx_event_pipe_t;
 
 typedef ngx_int_t (*ngx_event_pipe_input_filter_pt)(ngx_event_pipe_t *p,
                                                     ngx_buf_t *buf);
+typedef ssize_t (*ngx_event_pipe_input_chain_pt)(ngx_event_pipe_t *p,
+                                                 ngx_buf_t *buf, off_t limit);
+typedef void (*ngx_event_pipe_release_buf_pt)(ngx_event_pipe_t *p,
+                                              ngx_buf_t *buf);
 typedef ngx_int_t (*ngx_event_pipe_output_filter_pt)(void *data,
                                                      ngx_chain_t *chain);
 
@@ -42,6 +46,8 @@ struct ngx_event_pipe_s {
      */
 
     ngx_event_pipe_input_filter_pt    input_filter;
+    ngx_event_pipe_input_chain_pt     input_chain;
+    ngx_event_pipe_release_buf_pt     release_buf;
     void                             *input_ctx;
 
     ngx_event_pipe_output_filter_pt   output_filter;
